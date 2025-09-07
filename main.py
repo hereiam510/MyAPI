@@ -13,55 +13,80 @@ from playwright.async_api import async_playwright
 import smtplib
 from email.mime.text import MIMEText
 
-# --- Load ENV ---
+# =================================================
+#           CONFIGURATION SECTION
+#           (edit .env or these variables)
+# =================================================
 load_dotenv()
+
+# How many consecutive failures before email alert?
+EMAIL_ALERT_FAILURES = int(os.getenv('EMAIL_ALERT_FAILURES', 3))
+# This is the number you'll want to change to 5 if needed
+
+# How often to refresh the HKU token (in minutes)?
+TOKEN_REFRESH_INTERVAL_MINUTES = int(os.getenv("TOKEN_REFRESH_INTERVAL_MINUTES", 60))
+
+# App and credentials pulled from env for safety
 app_state = {
     "hku_auth_token": os.getenv("HKU_AUTH_TOKEN"),
-    "admin_api_key": os.getenv("ADMIN_API_KEY")
+    "admin_api_key": os.getenv("ADMIN_API_KEY"),
 }
 HKU_API_BASE_URL = "https://api.hku.hk"
+HKU_EMAIL = os.getenv("HKU_EMAIL")
+HKU_PASSWORD = os.getenv("HKU_PASSWORD")
+
+# Email alert config (edit .env for sensitive info)
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO")
+ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM")
+ALERT_EMAIL_PASSWORD = os.getenv("ALERT_EMAIL_PASSWORD")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# --- Email Alert ---
-def send_mfa_alert(reason="MFA intervention required."):
-    to_email = os.getenv("ALERT_EMAIL_TO")
-    from_email = os.getenv("ALERT_EMAIL_FROM")
-    from_password = os.getenv("ALERT_EMAIL_PASSWORD")
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    subject = "[HKU ChatGPT Proxy] MFA Required"
-
-    if not (to_email and from_email and from_password):
-        print("[ALERT] No alert email configured in .env -- no email will be sent!")
-        return
-
-    body = (
-        f"Automatic HKU token refresh has failed repeatedly due to MFA requirement.\n\n"
-        f"Reason: {reason}\n\n"
-        f"Please run the manual MFA recovery script to restore service.\n"
-        f"--\nHKU Proxy System\n"
-    )
-
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = from_email
-    msg['To'] = to_email
-
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(from_email, from_password)
-        server.sendmail(from_email, to_email, msg.as_string())
-        server.quit()
-        print(f"[ALERT] Email sent to {to_email}!")
-    except Exception as e:
-        print(f"[ALERT] Failed to send alert email: {e}")
-
-# --- Models ---
 REASONING_MODELS = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini"}
 STANDARD_MODELS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-chat", "DeepSeek-V3", "DeepSeek-R1"}
 
+# =================================================
+#           EMAIL ALERTING FUNCTION
+# =================================================
+def send_mfa_alert(reason="MFA intervention required."):
+    """
+    Send an email to ALERT_EMAIL_TO if auto-refresh fails.
+    Edit email template here as needed.
+    """
+    if not (ALERT_EMAIL_TO and ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD):
+        print("[ALERT] Missing email address or password in .env -- cannot send alert!")
+        return
+    subject = "[HKU ChatGPT Proxy] MFA Required"
+    body = (
+        "Automatic HKU token refresh has failed repeatedly.\n\n"
+        f"Reason: {reason}\n\n"
+        "Please run the manual MFA recovery script to restore service.\n"
+        "--\nHKU Proxy System\n"
+    )
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = ALERT_EMAIL_FROM
+    msg['To'] = ALERT_EMAIL_TO
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
+        server.sendmail(ALERT_EMAIL_FROM, ALERT_EMAIL_TO, msg.as_string())
+        server.quit()
+        print(f"[ALERT] Email sent to {ALERT_EMAIL_TO}!")
+    except Exception as e:
+        print(f"[ALERT] Failed to send alert email: {e}")
+
+# =================================================
+#           PLAYWRIGHT HKU LOGIN/TOKEN FUNCTION
+# =================================================
 async def fetch_hku_token(email, password):
+    """
+    Automated browser login to HKU ChatGPT, returns token if successful.
+    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
@@ -72,17 +97,21 @@ async def fetch_hku_token(email, password):
             await page.fill('input[type="email"],input[name="username"]', email)
             await page.click('button[type="submit"],input[type="submit"]')
         except Exception:
-            pass
+            pass  # Could be instant SSO, no email step
+
         try:
             await page.wait_for_selector('input[type="password"]', timeout=10000)
             await page.fill('input[type="password"]', password)
             await page.click('button[type="submit"],input[type="submit"]')
         except Exception:
-            pass
+            pass  # Already authenticated
+
         await page.wait_for_load_state('networkidle')
-        await asyncio.sleep(4)
+        await asyncio.sleep(4)  # Wait for SPA to load
 
         token = None
+
+        # Intercept outgoing token
         async def intercept_request(request):
             nonlocal token
             if "completions" in request.url:
@@ -91,6 +120,7 @@ async def fetch_hku_token(email, password):
                     token = auth.split("Bearer ")[1]
         page.on("request", intercept_request)
 
+        # Try to trigger token issue
         try:
             await page.fill('textarea', 'Hello')
             await page.keyboard.press('Enter')
@@ -100,49 +130,63 @@ async def fetch_hku_token(email, password):
         await browser.close()
         return token
 
+# =================================================
+#           TOKEN AUTO-REFRESH - MAIN BG LOGIC
+# =================================================
 async def refresh_token_background_loop(app_state):
-    interval_minutes = int(os.getenv("TOKEN_REFRESH_INTERVAL_MINUTES", "60"))
-    email = os.getenv("HKU_EMAIL")
-    password = os.getenv("HKU_PASSWORD")
-    max_failures = 3
+    """
+    Background task to refresh the HKU token every TOKEN_REFRESH_INTERVAL_MINUTES minutes.
+    After EMAIL_ALERT_FAILURES failures, sends an email alert and resets counter.
+    """
     failure_count = 0
     while True:
         try:
-            print(f"[TokenRefresh] Fetching new HKU Auth Token (interval: {interval_minutes}m)...")
-            token = await fetch_hku_token(email, password)
+            print(f"[TokenRefresh] Auto-refreshing HKU token (every {TOKEN_REFRESH_INTERVAL_MINUTES} min).")
+            token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
             if token:
                 app_state["hku_auth_token"] = token
-                print("[TokenRefresh] Token updated OK!")
+                print("[TokenRefresh] Token updated successfully.")
                 failure_count = 0
             else:
                 print("[TokenRefresh] Failed to update token!")
                 failure_count += 1
-                if failure_count >= max_failures:
+                if failure_count >= EMAIL_ALERT_FAILURES:
                     send_mfa_alert("Token refresh failed due to possible MFA requirement.")
-                    failure_count = 0
+                    failure_count = 0  # Avoid spamming
         except Exception as e:
             print(f"[TokenRefresh] ERROR: {e}")
             failure_count += 1
-            if failure_count >= max_failures:
+            if failure_count >= EMAIL_ALERT_FAILURES:
                 send_mfa_alert(f"Exception while refreshing token: {e}")
                 failure_count = 0
-        await asyncio.sleep(interval_minutes * 60)
+        await asyncio.sleep(TOKEN_REFRESH_INTERVAL_MINUTES * 60)
 
+# =================================================
+#           FASTAPI LIFESPAN
+# =================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Startup: begin background token refresher.
+    """
     asyncio.create_task(refresh_token_background_loop(app_state))
     print("HKU token refresh background task started.")
     yield
     print("App shutdown.")
 
+# =================================================
+#           FASTAPI APP DEFINITION
+# =================================================
 app = FastAPI(title="HKU ChatGPT Proxy", version="6.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# === SECURITY UTILITY ===
 def get_api_key(api_key: str = Security(API_KEY_HEADER)):
     if api_key != app_state["admin_api_key"]:
         raise HTTPException(status_code=403, detail="Invalid credentials")
     return api_key
 
+# === EVENT STREAMER ===
 async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
     try:
         async for chunk in response.aiter_bytes():
@@ -152,12 +196,17 @@ async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, No
     finally:
         await response.aclose()
 
+# =================================================
+#           MAIN PROXY ENDPOINT
+# =================================================
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
-    email = os.getenv("HKU_EMAIL")
-    password = os.getenv("HKU_PASSWORD")
+    """
+    Proxy endpoint: for OpenAI-compatible clients.
+    If the token is invalid, will attempt to auto-refresh.
+    """
     if not app_state["hku_auth_token"]:
-        token = await fetch_hku_token(email, password)
+        token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
         if not token:
             raise HTTPException(status_code=401, detail="No HKU token; login failed.")
         app_state["hku_auth_token"] = token
@@ -198,9 +247,10 @@ async def proxy_chat_completions(request: Request):
         try:
             req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
             resp = await client.send(req, stream=True)
+            # Retry once on 401 error (token expired)
             if resp.status_code == 401:
                 print("[Proxy] HKU token expired—fetching new one and retrying.")
-                new_token = await fetch_hku_token(email, password)
+                new_token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
                 if not new_token:
                     raise HTTPException(status_code=401, detail="Auto token refresh failed.")
                 app_state["hku_auth_token"] = new_token
@@ -240,8 +290,14 @@ async def proxy_chat_completions(request: Request):
             error_body = await e.response.aread()
             raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
 
+# =================================================
+#           ADMIN ROUTES
+# =================================================
 @app.post("/update-token")
 async def update_token(request: Request, api_key: str = Security(get_api_key)):
+    """
+    Update token manually via admin key.
+    """
     data = await request.json()
     new_token = data.get("token")
     if not new_token:
@@ -251,11 +307,16 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
 
 @app.post("/trigger-refresh")
 async def trigger_refresh(api_key: str = Security(get_api_key)):
-    email = os.getenv("HKU_EMAIL")
-    password = os.getenv("HKU_PASSWORD")
-    token = await fetch_hku_token(email, password)
+    """
+    Manually trigger a token refresh. Requires admin key.
+    """
+    token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
     if token:
         app_state["hku_auth_token"] = token
         return {"status": "ok", "new_token_set": True}
     else:
         return {"status": "fail"}
+
+# =================================================
+#            END OF FILE
+# =================================================
