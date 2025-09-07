@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service.",
-    version="2.4.0", # Final Corrected Version with System Message Injection
+    version="3.1.0", # Final version with robust streaming and correct headers
     lifespan=lifespan
 )
 app.add_middleware(
@@ -52,7 +52,6 @@ def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
     if not messages:
         raise HTTPException(status_code=400, detail="Request must include messages.")
     
-    # --- FINAL FIX: Inject system message if not present ---
     if not any(msg.get("role") == "system" for msg in messages):
         system_message = {"role": "system", "content": "You are an AI assistant that helps people find information."}
         messages.insert(0, system_message)
@@ -92,11 +91,22 @@ async def proxy_chat_completions(request: Request):
     params = {"deployment-id": deployment_id}
 
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {app_state['hku_auth_token']}",
-        "Origin": "https://chatgpt.hku.hk",
-        "Referer": "https://chatgpt.hku.hk/",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+        "accept": "text/event-stream",
+        "accept-language": "en-US,en;q=0.9", # Adjusted to a more common value
+        "authorization": f"Bearer {app_state['hku_auth_token']}",
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "dnt": "1",
+        "origin": "https://chatgpt.hku.hk",
+        "priority": "u=1, i",
+        "referer": "https://chatgpt.hku.hk/",
+        "sec-ch-ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
     }
     
     async with httpx.AsyncClient() as client:
