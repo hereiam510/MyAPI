@@ -1,6 +1,6 @@
 import os, httpx, asyncio, json
 from fastapi import FastAPI, Request, HTTPException, Security
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -14,7 +14,6 @@ app_state = {
     "admin_api_key": os.getenv("ADMIN_API_KEY", "your-super-secret-key")
 }
 HKU_API_BASE_URL = "https://api.hku.hk"
-# AZURE_API_VERSION is no longer needed
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # --- Lifespan & App Setup ---
@@ -28,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service.",
-    version="2.0.0", # Final Corrected Version
+    version="2.1.0", # Final Corrected Version with Stream Handling
     lifespan=lifespan
 )
 app.add_middleware(
@@ -46,7 +45,7 @@ def get_api_key(api_key: str = Security(api_key_header)):
     return api_key
 
 def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
-    defaults = {"max_completion_tokens": 2000, "temperature": 0.7, "top_p": 0.95, "stream": True}
+    defaults = {"max_completion_tokens": 2000, "temperature": 0.7, "top_p": 0.95}
     forward_payload = defaults.copy()
     
     messages = req_payload.get("messages")
@@ -54,7 +53,6 @@ def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Request must include messages.")
     forward_payload["messages"] = messages
     
-    # Map OpenAI params to Azure params
     if "max_tokens" in req_payload:
         forward_payload["max_completion_tokens"] = req_payload["max_tokens"]
     for key in ["temperature", "top_p", "stream"]:
@@ -70,17 +68,13 @@ async def proxy_chat_completions(request: Request):
         raise HTTPException(status_code=401, detail="Auth token not configured.")
     
     original_payload = await request.json()
+    is_streaming_request = original_payload.get("stream", False)
+    
     forward_payload = build_forward_payload(original_payload)
     
-    # CORRECTED: The path now matches the cURL command exactly.
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
-    
-    # CORRECTED: The params now only contain deployment-id, no api-version.
-    params = {
-        "deployment-id": original_payload.get("model", "gpt-4.1-nano")
-    }
+    params = {"deployment-id": original_payload.get("model", "gpt-4.1-nano")}
 
-    # CORRECTED: Added Origin, Referer, and User-Agent headers to mimic the browser.
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {app_state['hku_auth_token']}",
@@ -89,23 +83,59 @@ async def proxy_chat_completions(request: Request):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
     }
     
-    print(f"\n--- Forwarding Request to HKU ---\nURL: {target_url}\nParams: {params}\nPayload: {json.dumps(forward_payload, indent=2)}\n---------------------------------\n")
-    
     async with httpx.AsyncClient() as client:
         try:
             req = client.build_request("POST", target_url, params=params, json=forward_payload, headers=headers, timeout=300.0)
-            resp = await client.send(req, stream=True)
-            resp.raise_for_status()
+            
+            if is_streaming_request:
+                # Handle streaming request
+                resp = await client.send(req, stream=True)
+                resp.raise_for_status()
+                return StreamingResponse(resp.aiter_bytes(), status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+            else:
+                # Handle non-streaming request for the "Test" button
+                resp = await client.send(req, stream=True)
+                resp.raise_for_status()
+                
+                # Accumulate the streamed response into a single object
+                full_response_content = ""
+                final_choice = {}
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        try:
+                            # Strip "data: " prefix and parse JSON
+                            json_str = line[6:]
+                            if json_str.strip() and json_str != "[DONE]":
+                                data = json.loads(json_str)
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                if "content" in delta:
+                                    full_response_content += delta["content"]
+                                final_choice = data.get("choices", [{}])[0]
+                        except json.JSONDecodeError:
+                            continue # Ignore malformed lines
+                
+                # Construct a final, OpenAI-compatible JSON response
+                final_response_obj = {
+                    "id": f"chatcmpl-test-{os.urandom(8).hex()}",
+                    "object": "chat.completion",
+                    "created": int(__import__('time').time()),
+                    "model": original_payload.get("model", "gpt-4.1-nano"),
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": full_response_content
+                        },
+                        "finish_reason": final_choice.get("finish_reason", "stop")
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }
+                return JSONResponse(content=final_response_obj)
+
         except httpx.HTTPStatusError as e:
             error_details = await e.response.aread()
             print(f"ERROR from HKU Server: {e.response.status_code} - {error_details.decode()}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Upstream server error: {error_details.decode()}")
-
-    return StreamingResponse(
-        resp.aiter_bytes(),
-        status_code=resp.status_code,
-        media_type=resp.headers.get("content-type"),
-    )
 
 @app.post("/update-token")
 async def update_token(request: Request, api_key: str = Security(get_api_key)):
