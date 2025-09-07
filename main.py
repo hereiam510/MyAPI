@@ -4,6 +4,7 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware  # <-- IMPORT THIS
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from typing import Dict, Any
@@ -34,9 +35,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service with parameter forwarding and token hot-reload.",
-    version="1.2.0",
+    version="1.3.0", # Version updated
     lifespan=lifespan
 )
+
+# --- ADD THIS CORS MIDDLEWARE SECTION ---
+# This allows your web-based frontend to connect to the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+# -----------------------------------------
+
 
 # --- Security Function ---
 def get_api_key(api_key: str = Security(api_key_header)):
@@ -49,48 +62,25 @@ def get_api_key(api_key: str = Security(api_key_header)):
 
 # --- Helper Function to Build the Payload ---
 def build_forward_payload(request_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Constructs the payload to be forwarded to the HKU API.
-    This function ensures all compatible parameters are passed through.
-    """
-    # Define the default values as seen in the HKU web panel
     defaults = {
         "max_completion_tokens": 2000,
         "temperature": 0.7,
         "top_p": 0.95,
-        "stream": True # HKU endpoint seems to be stream-only
+        "stream": True
     }
-    
-    # Start with the defaults
     forward_payload = defaults.copy()
-    
-    # Get the messages from the incoming request
     messages = request_payload.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="Request must include messages.")
-        
     forward_payload["messages"] = messages
-    
-    # --- Parameter Mapping ---
-    # Map OpenAI parameter names to the names expected by the HKU/Azure endpoint.
-    # In this case, they are very similar.
-    
-    # 'max_tokens' in OpenAI maps to 'max_completion_tokens'
     if "max_tokens" in request_payload:
         forward_payload["max_completion_tokens"] = request_payload["max_tokens"]
-        
-    # 'temperature' is the same
     if "temperature" in request_payload:
         forward_payload["temperature"] = request_payload["temperature"]
-        
-    # 'top_p' is the same
     if "top_p" in request_payload:
         forward_payload["top_p"] = request_payload["top_p"]
-
-    # The 'stream' parameter should also be passed through
     if "stream" in request_payload:
         forward_payload["stream"] = request_payload["stream"]
-        
     return forward_payload
 
 # --- API Endpoints ---
@@ -98,27 +88,19 @@ def build_forward_payload(request_payload: Dict[str, Any]) -> Dict[str, Any]:
 async def proxy_chat_completions(request: Request):
     if not app_state["hku_auth_token"]:
         raise HTTPException(status_code=401, detail="Authentication token is not configured.")
-
-    # Get the original request body from the client
     original_payload = await request.json()
-    
-    # Build the payload that we will forward to the HKU service
     forward_payload = build_forward_payload(original_payload)
-
     deployment_id = original_payload.get("model", "gpt-4.1-nano")
     target_url = f"{HKU_API_BASE_URL}/stream/chat/completions?deployment-id={deployment_id}"
-    
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {app_state['hku_auth_token']}",
     }
-    
     async with httpx.AsyncClient() as client:
         hku_request = client.build_request(
             method="POST", url=target_url, json=forward_payload, headers=headers, timeout=300.0
         )
         hku_response = await client.send(hku_request, stream=True)
-
     return StreamingResponse(
         hku_response.aiter_bytes(),
         status_code=hku_response.status_code,
@@ -131,7 +113,6 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
     new_token = data.get("token")
     if not new_token:
         raise HTTPException(status_code=400, detail="JSON payload must contain a 'token' field.")
-    
     app_state["hku_auth_token"] = new_token
     print(f"Successfully updated HKU Auth Token at {asyncio.to_thread(lambda: __import__('datetime').datetime.now())}.")
     return {"message": "Token updated successfully."}
