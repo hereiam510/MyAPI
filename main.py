@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service.",
-    version="2.1.0", # Final Corrected Version with Stream Handling
+    version="2.2.0", # Final Corrected Version with new URL structure
     lifespan=lifespan
 )
 app.add_middleware(
@@ -72,8 +72,12 @@ async def proxy_chat_completions(request: Request):
     
     forward_payload = build_forward_payload(original_payload)
     
-    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
-    params = {"deployment-id": original_payload.get("model", "gpt-4.1-nano")}
+    # --- CORRECTED: Moved deployment-id into the URL path itself ---
+    deployment_id = original_payload.get("model", "gpt-4.1-nano")
+    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/{deployment_id}/chat/completions"
+    
+    # We no longer need to send deployment-id as a separate parameter
+    params = {}
 
     headers = {
         "Content-Type": "application/json",
@@ -83,27 +87,25 @@ async def proxy_chat_completions(request: Request):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
     }
     
+    print(f"\n--- Forwarding Request to HKU ---\nURL: {target_url}\nParams: {params}\nPayload: {json.dumps(forward_payload, indent=2)}\n---------------------------------\n")
+    
     async with httpx.AsyncClient() as client:
         try:
             req = client.build_request("POST", target_url, params=params, json=forward_payload, headers=headers, timeout=300.0)
             
             if is_streaming_request:
-                # Handle streaming request
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
                 return StreamingResponse(resp.aiter_bytes(), status_code=resp.status_code, media_type=resp.headers.get("content-type"))
             else:
-                # Handle non-streaming request for the "Test" button
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
                 
-                # Accumulate the streamed response into a single object
                 full_response_content = ""
                 final_choice = {}
                 async for line in resp.aiter_lines():
                     if line.startswith("data:"):
                         try:
-                            # Strip "data: " prefix and parse JSON
                             json_str = line[6:]
                             if json_str.strip() and json_str != "[DONE]":
                                 data = json.loads(json_str)
@@ -112,20 +114,16 @@ async def proxy_chat_completions(request: Request):
                                     full_response_content += delta["content"]
                                 final_choice = data.get("choices", [{}])[0]
                         except json.JSONDecodeError:
-                            continue # Ignore malformed lines
+                            continue
                 
-                # Construct a final, OpenAI-compatible JSON response
                 final_response_obj = {
                     "id": f"chatcmpl-test-{os.urandom(8).hex()}",
                     "object": "chat.completion",
                     "created": int(__import__('time').time()),
-                    "model": original_payload.get("model", "gpt-4.1-nano"),
+                    "model": deployment_id,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_response_content
-                        },
+                        "message": { "role": "assistant", "content": full_response_content },
                         "finish_reason": final_choice.get("finish_reason", "stop")
                     }],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
