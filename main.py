@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from typing import Dict, Any, AsyncGenerator
 from playwright.async_api import async_playwright
+import smtplib
+from email.mime.text import MIMEText
 
 # --- Load ENV ---
 load_dotenv()
@@ -20,7 +22,42 @@ app_state = {
 HKU_API_BASE_URL = "https://api.hku.hk"
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# --- Model Definitions ---
+# --- Email Alert ---
+def send_mfa_alert(reason="MFA intervention required."):
+    to_email = os.getenv("ALERT_EMAIL_TO")
+    from_email = os.getenv("ALERT_EMAIL_FROM")
+    from_password = os.getenv("ALERT_EMAIL_PASSWORD")
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    subject = "[HKU ChatGPT Proxy] MFA Required"
+
+    if not (to_email and from_email and from_password):
+        print("[ALERT] No alert email configured in .env -- no email will be sent!")
+        return
+
+    body = (
+        f"Automatic HKU token refresh has failed repeatedly due to MFA requirement.\n\n"
+        f"Reason: {reason}\n\n"
+        f"Please run the manual MFA recovery script to restore service.\n"
+        f"--\nHKU Proxy System\n"
+    )
+
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = from_email
+    msg['To'] = to_email
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(from_email, from_password)
+        server.sendmail(from_email, to_email, msg.as_string())
+        server.quit()
+        print(f"[ALERT] Email sent to {to_email}!")
+    except Exception as e:
+        print(f"[ALERT] Failed to send alert email: {e}")
+
+# --- Models ---
 REASONING_MODELS = {"gpt-5", "gpt-5-mini", "gpt-5-nano", "o4-mini"}
 STANDARD_MODELS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-chat", "DeepSeek-V3", "DeepSeek-R1"}
 
@@ -30,24 +67,20 @@ async def fetch_hku_token(email, password):
         context = await browser.new_context()
         page = await context.new_page()
         await page.goto("https://chatgpt.hku.hk/")
-        # Try filling email/username
         try:
             await page.wait_for_selector('input[type="email"],input[name="username"]', timeout=10000)
             await page.fill('input[type="email"],input[name="username"]', email)
             await page.click('button[type="submit"],input[type="submit"]')
         except Exception:
-            pass  # Some logins may skip straight to password
-
-        # Try filling password
+            pass
         try:
             await page.wait_for_selector('input[type="password"]', timeout=10000)
             await page.fill('input[type="password"]', password)
             await page.click('button[type="submit"],input[type="submit"]')
         except Exception:
-            pass  # Already authenticated
-
+            pass
         await page.wait_for_load_state('networkidle')
-        await asyncio.sleep(4)  # Give extra wait for SPA load
+        await asyncio.sleep(4)
 
         token = None
         async def intercept_request(request):
@@ -58,22 +91,21 @@ async def fetch_hku_token(email, password):
                     token = auth.split("Bearer ")[1]
         page.on("request", intercept_request)
 
-        # Try to trigger a completions request by sending a message (if possible)
         try:
             await page.fill('textarea', 'Hello')
             await page.keyboard.press('Enter')
             await asyncio.sleep(4)
         except Exception:
-            await asyncio.sleep(8)  # fallback just to wait longer for token
-
+            await asyncio.sleep(8)
         await browser.close()
         return token
 
-# ---- INTERVAL IN MINUTES ----
 async def refresh_token_background_loop(app_state):
-    interval_minutes = int(os.getenv("TOKEN_REFRESH_INTERVAL_MINUTES", "60"))  # default: every hour
+    interval_minutes = int(os.getenv("TOKEN_REFRESH_INTERVAL_MINUTES", "60"))
     email = os.getenv("HKU_EMAIL")
     password = os.getenv("HKU_PASSWORD")
+    max_failures = 3
+    failure_count = 0
     while True:
         try:
             print(f"[TokenRefresh] Fetching new HKU Auth Token (interval: {interval_minutes}m)...")
@@ -81,10 +113,19 @@ async def refresh_token_background_loop(app_state):
             if token:
                 app_state["hku_auth_token"] = token
                 print("[TokenRefresh] Token updated OK!")
+                failure_count = 0
             else:
                 print("[TokenRefresh] Failed to update token!")
+                failure_count += 1
+                if failure_count >= max_failures:
+                    send_mfa_alert("Token refresh failed due to possible MFA requirement.")
+                    failure_count = 0
         except Exception as e:
             print(f"[TokenRefresh] ERROR: {e}")
+            failure_count += 1
+            if failure_count >= max_failures:
+                send_mfa_alert(f"Exception while refreshing token: {e}")
+                failure_count = 0
         await asyncio.sleep(interval_minutes * 60)
 
 @asynccontextmanager
@@ -111,13 +152,11 @@ async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, No
     finally:
         await response.aclose()
 
-# ---- MAIN PROXY ENDPOINT - auto-refresh on 401 error ----
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     email = os.getenv("HKU_EMAIL")
     password = os.getenv("HKU_PASSWORD")
     if not app_state["hku_auth_token"]:
-        # No token, try a refresh immediately
         token = await fetch_hku_token(email, password)
         if not token:
             raise HTTPException(status_code=401, detail="No HKU token; login failed.")
@@ -159,11 +198,8 @@ async def proxy_chat_completions(request: Request):
         try:
             req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
             resp = await client.send(req, stream=True)
-            # ---
-            # If the token is expired, refresh it immediately and retry ONCE
             if resp.status_code == 401:
                 print("[Proxy] HKU token expired—fetching new one and retrying.")
-                # Try to auto-fetch new token
                 new_token = await fetch_hku_token(email, password)
                 if not new_token:
                     raise HTTPException(status_code=401, detail="Auto token refresh failed.")
@@ -171,7 +207,6 @@ async def proxy_chat_completions(request: Request):
                 headers["authorization"] = f"Bearer {new_token}"
                 req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
                 resp = await client.send(req, stream=True)
-            # ---
             resp.raise_for_status()
             client_wants_stream = req_payload.get("stream", False)
             if client_wants_stream:
