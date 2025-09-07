@@ -51,7 +51,6 @@ async def proxy_chat_completions(request: Request):
 
     req_payload = await request.json()
     
-    # Prepare payload, injecting system message if needed
     messages = req_payload.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="Request must include messages.")
@@ -63,10 +62,9 @@ async def proxy_chat_completions(request: Request):
         "max_completion_tokens": req_payload.get("max_tokens", 2000),
         "temperature": req_payload.get("temperature", 0.7),
         "top_p": req_payload.get("top_p", 0.95),
-        "stream": req_payload.get("stream", False),
+        "stream": True,
     }
 
-    # Prepare request details for HKU API, now with all necessary headers
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
     headers = {
@@ -86,16 +84,32 @@ async def proxy_chat_completions(request: Request):
             resp = await client.send(req, stream=True)
             resp.raise_for_status()
 
-            if forward_payload.get("stream"):
+            client_wants_stream = req_payload.get("stream", False)
+
+            if client_wants_stream:
                 return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
             else:
-                # Aggregate non-streaming response for the "Test" button
-                full_content = "".join([
-                    json.loads(line[6:])["choices"][0].get("delta", {}).get("content", "")
-                    async for line in resp.aiter_lines()
-                    if line.startswith("data:") and "[DONE]" not in line
-                ])
+                # --- BUG FIX ---
+                # This logic is now more robust. It safely checks if 'choices' has content
+                # before trying to access it, preventing the IndexError crash.
+                content_chunks = []
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:") and "[DONE]" not in line:
+                        try:
+                            data = json.loads(line[6:])
+                            # Safely access the content
+                            if "choices" in data and data["choices"]:
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content")
+                                if content:
+                                    content_chunks.append(content)
+                        except json.JSONDecodeError:
+                            print(f"Warning: Could not decode JSON from line: {line}")
+                            continue
+                
+                full_content = "".join(content_chunks)
                 await resp.aclose()
+
                 return JSONResponse({
                     "id": f"chatcmpl-test-{os.urandom(8).hex()}", "object": "chat.completion", "created": int(__import__('time').time()), "model": deployment_id,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
@@ -113,4 +127,3 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
         raise HTTPException(status_code=400, detail="Payload must contain a 'token' field.")
     app_state["hku_auth_token"] = new_token
     return {"message": "Token updated successfully."}
-
