@@ -37,7 +37,7 @@ Find the Authorization header.
 
 Copy the entire long string that comes after Bearer . It will start with ey....
 
-<!-- You can replace this with a screenshot if you like -->
+!(https://www.google.com/search?q=https://i.imgur.com/fK5nC2j.png) <!-- You can replace this with your own screenshot -->
 
 Step 2: Configure the Project
 Clone or download this project to your local machine.
