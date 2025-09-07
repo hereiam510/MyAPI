@@ -18,6 +18,10 @@ app_state = {
 }
 
 HKU_API_BASE_URL = "https://api.hku.hk/azure-openai-api"
+# --- ADD THIS: A common API version for Azure OpenAI ---
+AZURE_API_VERSION = "2023-07-01-preview" 
+# ---------------------------------------------------
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # --- Lifespan Management ---
@@ -35,7 +39,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service with parameter forwarding and token hot-reload.",
-    version="1.4.0", # Version updated
+    version="1.5.0", # Version updated
     lifespan=lifespan
 )
 
@@ -87,16 +91,15 @@ async def proxy_chat_completions(request: Request):
     original_payload = await request.json()
     forward_payload = build_forward_payload(original_payload)
     
-    # --- FIX IS HERE ---
-    # Define the base endpoint path
     target_path = "/stream/chat/completions"
     target_url = f"{HKU_API_BASE_URL}{target_path}"
     
-    # Define the query parameters separately
+    # --- FIX IS HERE: ADD THE API-VERSION PARAMETER ---
     params = {
-        "deployment-id": original_payload.get("model", "gpt-4.1-nano")
+        "deployment-id": original_payload.get("model", "gpt-4.1-nano"),
+        "api-version": AZURE_API_VERSION 
     }
-    # ------------------
+    # ----------------------------------------------------
 
     headers = {
         "Content-Type": "application/json",
@@ -104,7 +107,6 @@ async def proxy_chat_completions(request: Request):
     }
     
     async with httpx.AsyncClient() as client:
-        # Pass the params dict to the 'params' argument of build_request
         hku_request = client.build_request(
             method="POST", url=target_url, params=params, json=forward_payload, headers=headers, timeout=300.0
         )
@@ -123,7 +125,6 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
     if not new_token:
         raise HTTPException(status_code=400, detail="JSON payload must contain a 'token' field.")
     app_state["hku_auth_token"] = new_token
-    # Corrected the print statement to avoid a potential bug in some environments
     current_time = __import__('datetime').datetime.now()
     print(f"Successfully updated HKU Auth Token at {current_time}.")
     return {"message": "Token updated successfully."}
