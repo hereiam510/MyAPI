@@ -16,13 +16,27 @@ app_state = {
 HKU_API_BASE_URL = "https://api.hku.hk"
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# --- Model Definitions ---
+# Models that use 'reasoning_effort' instead of 'top_p'
+REASONING_MODELS = {
+    "gpt-5", "gpt-5-mini", "gpt-5-nano", 
+    "o4-mini"
+}
+# Models that use standard 'temperature' and 'top_p'
+STANDARD_MODELS = {
+    "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", 
+    "gpt-5-chat", 
+    "DeepSeek-V3", "DeepSeek-R1"
+}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Successfully loaded HKU Auth Token." if app_state["hku_auth_token"] else "WARNING: HKU_AUTH_TOKEN not found.")
     yield
     print("Shutting down.")
 
-app = FastAPI(title="HKU ChatGPT Proxy", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="HKU ChatGPT Proxy", version="5.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -59,26 +73,30 @@ async def proxy_chat_completions(request: Request):
     
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
 
-    # --- MODEL-SPECIFIC PAYLOAD LOGIC ---
-    # Build the payload based on the requested model ID.
-    if deployment_id == "gpt-5":
-        # gpt-5 requires 'reasoning_effort' and doesn't use 'top_p'.
-        forward_payload = {
-            "messages": messages,
-            "max_completion_tokens": req_payload.get("max_tokens", 10000),
-            "temperature": req_payload.get("temperature", 1),
-            "reasoning_effort": "medium", # Default value from captured request
-            "stream": True,
-        }
+    # --- DYNAMIC PAYLOAD CONSTRUCTION ---
+    # Base payload for all models
+    forward_payload = {
+        "messages": messages,
+        "stream": True,
+        "max_completion_tokens": req_payload.get("max_tokens", 2000)
+    }
+
+    if deployment_id in REASONING_MODELS:
+        # For models like gpt-5 and o4-mini, pass 'temperature' and 'reasoning_effort'
+        forward_payload["temperature"] = req_payload.get("temperature", 1.0)
+        # Get 'reasoning_effort' from custom body params, default to 'medium'
+        forward_payload["reasoning_effort"] = req_payload.get("reasoning_effort", "medium")
+    
+    elif deployment_id in STANDARD_MODELS:
+        # For models like gpt-4.1 and DeepSeek, pass 'temperature' and 'top_p'
+        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
+        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
+    
     else:
-        # Default payload for other models like gpt-4.1-nano.
-        forward_payload = {
-            "messages": messages,
-            "max_completion_tokens": req_payload.get("max_tokens", 2000),
-            "temperature": req_payload.get("temperature", 0.7),
-            "top_p": req_payload.get("top_p", 0.95),
-            "stream": True,
-        }
+        # Fallback for any unknown models
+        print(f"Warning: Unknown model '{deployment_id}'. Using standard parameters.")
+        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
+        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
 
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
     headers = {
