@@ -57,15 +57,29 @@ async def proxy_chat_completions(request: Request):
     if not any(msg.get("role") == "system" for msg in messages):
         messages.insert(0, {"role": "system", "content": "You are an AI assistant that helps people find information."})
     
-    forward_payload = {
-        "messages": messages,
-        "max_completion_tokens": req_payload.get("max_tokens", 2000),
-        "temperature": req_payload.get("temperature", 0.7),
-        "top_p": req_payload.get("top_p", 0.95),
-        "stream": True,
-    }
-
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
+
+    # --- MODEL-SPECIFIC PAYLOAD LOGIC ---
+    # Build the payload based on the requested model ID.
+    if deployment_id == "gpt-5":
+        # gpt-5 requires 'reasoning_effort' and doesn't use 'top_p'.
+        forward_payload = {
+            "messages": messages,
+            "max_completion_tokens": req_payload.get("max_tokens", 10000),
+            "temperature": req_payload.get("temperature", 1),
+            "reasoning_effort": "medium", # Default value from captured request
+            "stream": True,
+        }
+    else:
+        # Default payload for other models like gpt-4.1-nano.
+        forward_payload = {
+            "messages": messages,
+            "max_completion_tokens": req_payload.get("max_tokens", 2000),
+            "temperature": req_payload.get("temperature", 0.7),
+            "top_p": req_payload.get("top_p", 0.95),
+            "stream": True,
+        }
+
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
     headers = {
         "accept": "text/event-stream",
@@ -89,15 +103,11 @@ async def proxy_chat_completions(request: Request):
             if client_wants_stream:
                 return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
             else:
-                # --- BUG FIX ---
-                # This logic is now more robust. It safely checks if 'choices' has content
-                # before trying to access it, preventing the IndexError crash.
                 content_chunks = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data:") and "[DONE]" not in line:
                         try:
                             data = json.loads(line[6:])
-                            # Safely access the content
                             if "choices" in data and data["choices"]:
                                 delta = data["choices"][0].get("delta", {})
                                 content = delta.get("content")
