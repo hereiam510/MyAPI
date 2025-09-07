@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     yield
     print("Shutting down.")
 
-app = FastAPI(title="HKU ChatGPT Proxy", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="HKU ChatGPT Proxy", version="4.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -66,15 +66,18 @@ async def proxy_chat_completions(request: Request):
         "stream": req_payload.get("stream", False),
     }
 
-    # Prepare request details for HKU API
+    # Prepare request details for HKU API, now with all necessary headers
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
     headers = {
-        "Authorization": f"Bearer {app_state['hku_auth_token']}",
-        "Content-Type": "application/json",
-        "Origin": "https://chatgpt.hku.hk",
-        "Referer": "https://chatgpt.hku.hk/",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "accept": "text/event-stream",
+        "authorization": f"Bearer {app_state['hku_auth_token']}",
+        "content-type": "application/json",
+        "origin": "https://chatgpt.hku.hk",
+        "referer": "https://chatgpt.hku.hk/",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
     }
 
     async with httpx.AsyncClient() as client:
