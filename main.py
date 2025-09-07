@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service.",
-    version="2.3.0", # Final Corrected Version with robust streaming
+    version="2.4.0", # Final Corrected Version with System Message Injection
     lifespan=lifespan
 )
 app.add_middleware(
@@ -48,9 +48,15 @@ def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
     defaults = {"max_completion_tokens": 2000, "temperature": 0.7, "top_p": 0.95}
     forward_payload = defaults.copy()
     
-    messages = req_payload.get("messages")
+    messages = req_payload.get("messages", [])
     if not messages:
         raise HTTPException(status_code=400, detail="Request must include messages.")
+    
+    # --- FINAL FIX: Inject system message if not present ---
+    if not any(msg.get("role") == "system" for msg in messages):
+        system_message = {"role": "system", "content": "You are an AI assistant that helps people find information."}
+        messages.insert(0, system_message)
+        
     forward_payload["messages"] = messages
     
     if "max_tokens" in req_payload:
@@ -61,16 +67,14 @@ def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
             
     return forward_payload
 
-# --- CORRECTED: Robust async generator for streaming ---
 async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
     try:
         async for chunk in response.aiter_bytes():
             yield chunk
     except httpx.ReadError:
-        print("Stream ended: Connection closed by the server as expected.")
+        print("Stream ended: Connection closed by server.")
     finally:
         await response.aclose()
-
 
 # --- API Endpoints ---
 @app.post("/v1/chat/completions")
@@ -102,9 +106,8 @@ async def proxy_chat_completions(request: Request):
             if is_streaming_request:
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
-                # Use the robust stream_generator
                 return StreamingResponse(stream_generator(resp), status_code=resp.status_code, media_type=resp.headers.get("content-type"))
-            else:
+            else: # For the "Test" button
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
                 
@@ -128,14 +131,10 @@ async def proxy_chat_completions(request: Request):
                     "object": "chat.completion",
                     "created": int(__import__('time').time()),
                     "model": deployment_id,
-                    "choices": [{
-                        "index": 0,
-                        "message": { "role": "assistant", "content": full_response_content },
-                        "finish_reason": final_choice.get("finish_reason", "stop")
-                    }],
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": full_response_content}, "finish_reason": final_choice.get("finish_reason", "stop")}],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 }
-                await resp.aclose() # Ensure the stream is closed
+                await resp.aclose()
                 return JSONResponse(content=final_response_obj)
 
         except httpx.HTTPStatusError as e:
