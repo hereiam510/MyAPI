@@ -5,7 +5,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from typing import Dict, Any
+from typing import Dict, Any, AsyncGenerator
 
 # --- Configuration ---
 load_dotenv()
@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service.",
-    version="2.2.0", # Final Corrected Version with new URL structure
+    version="2.3.0", # Final Corrected Version with robust streaming
     lifespan=lifespan
 )
 app.add_middleware(
@@ -61,6 +61,17 @@ def build_forward_payload(req_payload: Dict[str, Any]) -> Dict[str, Any]:
             
     return forward_payload
 
+# --- CORRECTED: Robust async generator for streaming ---
+async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
+    try:
+        async for chunk in response.aiter_bytes():
+            yield chunk
+    except httpx.ReadError:
+        print("Stream ended: Connection closed by the server as expected.")
+    finally:
+        await response.aclose()
+
+
 # --- API Endpoints ---
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
@@ -72,12 +83,9 @@ async def proxy_chat_completions(request: Request):
     
     forward_payload = build_forward_payload(original_payload)
     
-    # --- CORRECTED: Moved deployment-id into the URL path itself ---
     deployment_id = original_payload.get("model", "gpt-4.1-nano")
-    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/{deployment_id}/chat/completions"
-    
-    # We no longer need to send deployment-id as a separate parameter
-    params = {}
+    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
+    params = {"deployment-id": deployment_id}
 
     headers = {
         "Content-Type": "application/json",
@@ -87,8 +95,6 @@ async def proxy_chat_completions(request: Request):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
     }
     
-    print(f"\n--- Forwarding Request to HKU ---\nURL: {target_url}\nParams: {params}\nPayload: {json.dumps(forward_payload, indent=2)}\n---------------------------------\n")
-    
     async with httpx.AsyncClient() as client:
         try:
             req = client.build_request("POST", target_url, params=params, json=forward_payload, headers=headers, timeout=300.0)
@@ -96,7 +102,8 @@ async def proxy_chat_completions(request: Request):
             if is_streaming_request:
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
-                return StreamingResponse(resp.aiter_bytes(), status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+                # Use the robust stream_generator
+                return StreamingResponse(stream_generator(resp), status_code=resp.status_code, media_type=resp.headers.get("content-type"))
             else:
                 resp = await client.send(req, stream=True)
                 resp.raise_for_status()
@@ -128,6 +135,7 @@ async def proxy_chat_completions(request: Request):
                     }],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 }
+                await resp.aclose() # Ensure the stream is closed
                 return JSONResponse(content=final_response_obj)
 
         except httpx.HTTPStatusError as e:
