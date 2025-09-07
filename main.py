@@ -18,7 +18,6 @@ app_state = {
     "admin_api_key": os.getenv("ADMIN_API_KEY", "your-super-secret-key")
 }
 
-# Let's try the base URL without the trailing path segment
 HKU_API_BASE_URL = "https://api.hku.hk"
 AZURE_API_VERSION = "2023-07-01-preview"
 
@@ -39,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="HKU ChatGPT Proxy",
     description="A proxy for the HKU Azure service with parameter forwarding and token hot-reload.",
-    version="1.6.0", # Version updated for debugging
+    version="1.7.0", # Final Version
     lifespan=lifespan
 )
 
@@ -91,9 +90,10 @@ async def proxy_chat_completions(request: Request):
     original_payload = await request.json()
     forward_payload = build_forward_payload(original_payload)
     
-    # Construct the full path
-    target_path = f"/azure-openai-api/stream/chat/completions"
+    # --- FINAL FIX IS HERE: Removed "/stream" from the path ---
+    target_path = f"/azure-openai-api/chat/completions"
     target_url = f"{HKU_API_BASE_URL}{target_path}"
+    # ---------------------------------------------------------
     
     params = {
         "deployment-id": original_payload.get("model", "gpt-4.1-nano"),
@@ -105,14 +105,13 @@ async def proxy_chat_completions(request: Request):
         "Authorization": f"Bearer {app_state['hku_auth_token']}",
     }
     
-    # --- ADDED DEBUG LOGGING ---
+    # Debug logging can be removed later, but is fine to keep for now
     print("\n--- Outgoing Request to HKU ---")
     print(f"URL: {target_url}")
     print(f"Params: {params}")
     print(f"Headers: {{'Authorization': 'Bearer [REDACTED]', 'Content-Type': 'application/json'}}")
     print(f"Payload: {json.dumps(forward_payload, indent=2)}")
     print("-----------------------------\n")
-    # ---------------------------
     
     async with httpx.AsyncClient() as client:
         try:
@@ -120,12 +119,9 @@ async def proxy_chat_completions(request: Request):
                 method="POST", url=target_url, params=params, json=forward_payload, headers=headers, timeout=300.0
             )
             hku_response = await client.send(hku_request, stream=True)
-
-            # Raise an exception for 4xx/5xx responses to see the error clearly
             hku_response.raise_for_status()
 
         except httpx.HTTPStatusError as e:
-            # Log the error response from the server for better debugging
             error_details = await e.response.aread()
             print(f"ERROR from HKU Server: {e.response.status_code} - {error_details.decode()}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Error from upstream server: {error_details.decode()}")
