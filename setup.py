@@ -176,8 +176,6 @@ def create_env_file():
     """Interactively gathers user input and creates the .env file."""
     print("\n--- Configuring .env File ---")
     
-    # --- BUG FIX SECTION ---
-    # The safety check to prevent accidental overwrites has been restored.
     if is_env_file_configured(".env"):
         overwrite = input("⚠️ A configured .env file already exists. Do you want to overwrite it with new settings? (y/n): ").lower()
         if overwrite != 'y':
@@ -276,11 +274,14 @@ def start_docker_service():
             print("Service starting, waiting 5 seconds to verify status...")
             time.sleep(5)
             
+            # --- MODIFIED SECTION ---
+            # Using a more robust command to check the container's status directly.
             verify_success, stdout = run_command(
-                'docker-compose ps --services --filter "status=running"',
+                'docker ps --filter "name=hku_proxy_service" --filter "status=running"',
                 "Failed to check service status."
             )
             
+            # The command returns output if the container is found and running.
             if verify_success and "hku_proxy_service" in stdout:
                 config = {}
                 if os.path.exists('.env'):
