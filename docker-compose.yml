@@ -1,3 +1,6 @@
+# docker-compose.yml
+name: "hku-proxy-project" 
+
 services:
   hku-proxy:
     build: .
