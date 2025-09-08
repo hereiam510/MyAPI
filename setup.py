@@ -4,6 +4,7 @@ import sys
 import os
 import secrets
 import getpass
+import shutil
 
 def run_command(command, error_message):
     """Runs a command and exits if it fails."""
@@ -84,8 +85,6 @@ def create_env_file():
     env_content.append(f'HKU_EMAIL="{hku_email}"')
     env_content.append(f'HKU_PASSWORD="{hku_password}"')
 
-    # --- MODIFIED SECTION ---
-    # Consolidated and clarified the instructions for the Admin API Key.
     print("\nNext, you will set an Admin API Key.")
     print("This key is required for the manual MFA refresh script, so you MUST save it.")
     print("You can either provide your own key or leave the prompt blank to generate a secure random one.")
@@ -138,9 +137,25 @@ def create_env_file():
         return False
 
 def install_local_dependencies():
-    """Installs local Python and Playwright dependencies."""
+    """Installs local Python and Playwright dependencies, detecting `uv`."""
     print("\n--- Installing Local Dependencies for MFA Script ---")
-    if not run_command(f"{sys.executable} -m pip install -r requirements.txt", "Failed to install Python packages from requirements.txt."):
+    
+    # --- MODIFIED SECTION ---
+    # Detects if 'uv' is installed and uses it, otherwise falls back to pip
+    # while providing helpful feedback to the user.
+    installer = "pip"
+    if shutil.which("uv"):
+        installer = "uv pip"
+        print("✅ Detected `uv` package manager. Using `uv pip` for installation.")
+    else:
+        print("⚠️  NOTE: `uv` was not found. Falling back to standard `pip`.")
+        print("   For a much faster installation experience, consider installing uv:")
+        print("   https://github.com/astral-sh/uv")
+
+    install_cmd = f"{installer} install -r requirements.txt"
+    error_msg = f"Failed to install Python packages using `{installer}`."
+    
+    if not run_command(install_cmd, error_msg):
         return False
     print("✅ Python packages installed.")
     
