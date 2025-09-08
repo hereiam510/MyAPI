@@ -10,15 +10,16 @@ USER_DATA_DIR = "./playwright_user_data"
 
 async def fetch_hku_token(email, password, headless=True):
     """
-    Launches a Playwright browser to log in and capture the auth token.
+    Launches a Playwright browser for login.
     - In headless mode, it attempts a fully automated login.
-    - In non-headless mode (for setup), it opens a browser and waits for the user to log in manually.
+    - In non-headless mode (for setup), it opens a responsive browser for manual login.
     """
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=headless,
-            slow_mo=50,
+            # This is the fix: slow_mo is off during manual runs, making the browser responsive.
+            slow_mo=50 if headless else None,
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
         page = context.pages[0] if context.pages else await context.new_page()
@@ -41,9 +42,11 @@ async def fetch_hku_token(email, password, headless=True):
         try:
             # --- LOGIC FOR AUTOMATED (HEADLESS) MODE ---
             if headless:
+                # Check if already logged in by looking for the textarea
                 is_logged_in = await page.locator('textarea').is_visible(timeout=10000)
+                
                 if not is_logged_in:
-                    logger.info("Not logged in. Starting the full login process.")
+                    logger.info("Not logged in. Starting the full automated login process.")
                     await page.click('button:has-text("Sign In")', timeout=20000)
                     await page.wait_for_load_state('networkidle', timeout=30000)
                     
@@ -70,8 +73,6 @@ async def fetch_hku_token(email, password, headless=True):
                 logger.info("The script will wait until a token is captured.")
 
             # Universal token waiting logic for both modes
-            # For manual mode, this will wait indefinitely until you log in.
-            # For auto mode, it will wait for the token after the automated steps.
             await asyncio.wait_for(token_captured.wait(), timeout=None if not headless else 180)
             logger.info("✅ HKU Auth Token captured successfully!")
 
