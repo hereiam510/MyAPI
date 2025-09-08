@@ -36,16 +36,21 @@ async def fetch_hku_token(email, password, headless=True):
                 await page.click('button:has-text("Sign In")', timeout=10000)
                 await page.wait_for_load_state('networkidle', timeout=30000)
                 
-                # Step 2: Target the iframe and enter the email
-                logger.info("Locating login iframe and entering email address.")
+                # --- FINAL MODIFIED SECTION ---
+                # Target elements by their placeholder text, which is more reliable.
+                logger.info("Locating login iframe.")
                 login_frame = page.frame_locator('iframe').first
-                await login_frame.get_by_label("Email, phone, or Skype").fill(email)
-                await login_frame.get_by_role("button", name="Next").click()
 
-                # Step 3: Enter password/PIN on the HKU login page (still in the iframe)
+                # Step 2: Enter email using the placeholder text
+                logger.info("Entering email address inside iframe.")
+                # The placeholder text is "Email or phone" in Chinese
+                await login_frame.get_by_placeholder("電子郵件或電話").fill(email)
+                await login_frame.get_by_role("button", name="下一步").click()
+
+                # Step 3: Enter password/PIN using its placeholder
                 logger.info("Waiting for password page and entering password (PIN).")
                 await login_frame.get_by_placeholder("PIN").fill(password)
-                await login_frame.get_by_role("button", name="Sign in").click()
+                await login_frame.get_by_role("button", name="登入").click()
 
                 # Step 4: Wait for the final redirect back to the chat interface
                 logger.info("Login submitted, waiting for main chat page to load.")
