@@ -10,10 +10,11 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Dict, Any, AsyncGenerator
 import smtplib
 from email.mime.text import MIMEText
 
+# Import the shared token fetching function and new logger setup
 from token_fetcher import fetch_hku_token
 from logger_config import setup_logging
 
@@ -101,6 +102,7 @@ async def refresh_token_background_loop(app_state):
 
         try:
             logger.info("Attempting to auto-refresh HKU token.")
+            # Use the shared function in headless mode
             token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD, headless=True)
             
             if token:
@@ -157,29 +159,83 @@ async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, No
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     if not app_state["hku_auth_token"]:
-        raise HTTPException(status_code=401, detail="No HKU token available. Service may be initializing.")
+        raise HTTPException(status_code=401, detail="No HKU token available. The service may be waiting for initial refresh.")
 
     req_payload = await request.json()
-    # ... (rest of the function remains the same)
+    messages = req_payload.get("messages", [])
+    if not messages: raise HTTPException(status_code=400, detail="Request must include messages.")
+    if not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": "You are an AI assistant that helps people find information."})
+    
+    deployment_id = req_payload.get("model", "gpt-4.1-nano")
+    forward_payload = {
+        "messages": messages, "stream": True, "max_completion_tokens": req_payload.get("max_tokens", 2000)
+    }
+    if deployment_id in REASONING_MODELS:
+        forward_payload["temperature"] = req_payload.get("temperature", 1.0)
+        forward_payload["reasoning_effort"] = req_payload.get("reasoning_effort", "medium")
+    else:
+        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
+        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
+    
+    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
+    headers = {
+        "accept": "text/event-stream", "authorization": f"Bearer {app_state['hku_auth_token']}",
+        "content-type": "application/json", "origin": "https://chatgpt.hku.hk", "referer": "https://chatgpt.hku.hk/",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    }
     
     async with httpx.AsyncClient() as client:
         try:
             req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
             resp = await client.send(req, stream=True)
             if resp.status_code == 401:
-                logger.error("Received 401 Unauthorized from upstream. Token is likely expired.")
-                raise HTTPException(status_code=401, detail="The HKU Auth Token is invalid or expired.")
+                logger.error("Received 401 Unauthorized from upstream. Token is likely expired. Manual refresh may be needed.")
+                raise HTTPException(status_code=401, detail="The HKU Auth Token is invalid or expired. Please use the manual refresh script if the problem persists.")
             
             resp.raise_for_status()
             client_wants_stream = req_payload.get("stream", False)
             if client_wants_stream:
                 return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
             else:
-                # ... (non-streaming logic remains the same)
-                return JSONResponse(...)
+                content_chunks = []
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:") and "[DONE]" not in line:
+                        try:
+                            data = json.loads(line[6:])
+                            if "choices" in data and data["choices"]:
+                                delta = data["choices"][0].get("delta", {})
+                                if "content" in delta: content_chunks.append(delta["content"])
+                        except json.JSONDecodeError: continue
+                full_content = "".join(content_chunks)
+                await resp.aclose()
+                return JSONResponse({
+                    "id": f"chatcmpl-test-{os.urandom(8).hex()}", "object": "chat.completion",
+                    "created": int(time.time()), "model": deployment_id,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                })
         except httpx.HTTPStatusError as e:
             error_body = await e.response.aread()
             logger.error(f"Upstream API error: {e.response.status_code} - {error_body.decode()}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
 
-# ... (rest of the file remains the same)
+# =================================================
+#           ADMIN & HEALTH ROUTES
+# =================================================
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+@app.post("/update-token")
+async def update_token(request: Request, api_key: str = Security(get_api_key)):
+    data = await request.json()
+    new_token = data.get("token")
+    if not new_token: raise HTTPException(status_code=400, detail="Payload must contain a 'token' field.")
+    
+    app_state["hku_auth_token"] = new_token
+    if app_state["is_paused"].is_set():
+        app_state["is_paused"].clear()
+    
+    logger.info("Token was updated manually via the /update-token endpoint.")
+    return {"message": "Token updated successfully and auto-refresh has been resumed."}
