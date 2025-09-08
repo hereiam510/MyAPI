@@ -7,15 +7,6 @@ logger = logging.getLogger(__name__)
 async def fetch_hku_token(email, password, headless=True):
     """
     Launches a Playwright browser to log into the HKU service and capture the auth token.
-
-    Args:
-        email (str): The user's HKU email address.
-        password (str): The user's HKU password.
-        headless (bool): If True, runs the browser in headless mode. 
-                         If False, the browser window will be visible for manual interaction.
-
-    Returns:
-        str: The captured bearer token, or None if unsuccessful.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -37,7 +28,6 @@ async def fetch_hku_token(email, password, headless=True):
         
         page.on("request", intercept_request)
 
-        # Automated login for headless mode
         if headless:
             try:
                 await page.wait_for_selector('input[type="email"],input[name="username"]', timeout=10000)
@@ -48,21 +38,19 @@ async def fetch_hku_token(email, password, headless=True):
                 await page.click('button[type="submit"],input[type="submit"]')
                 
                 await page.wait_for_load_state('networkidle', timeout=30000)
-                await asyncio.sleep(4) # Allow time for redirects and page loads
+                await asyncio.sleep(4)
 
-                # Trigger a request to capture the token
                 await page.fill('textarea', 'Hello')
                 await page.keyboard.press('Enter')
                 await asyncio.sleep(4)
 
             except Exception as e:
-                logger.error(f"Automated login failed: {e}", exc_info=True)
+                await page.screenshot(path="debug_screenshot.png")
+                logger.error(f"Automated login failed. Screenshot saved to debug_screenshot.png inside the container. Error: {e}", exc_info=True)
                 await browser.close()
                 return None
         
-        # For non-headless mode, wait for user interaction
         try:
-            # Set a timeout for the user to complete the login
             await asyncio.wait_for(token_captured.wait(), timeout=180) 
             logger.info("HKU Auth Token captured successfully!")
         except asyncio.TimeoutError:
