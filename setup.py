@@ -26,25 +26,49 @@ def check_prerequisites():
 
 def is_env_file_configured(filepath=".env"):
     """
-    Checks if a .env file exists and contains user-modified data,
-    not just the default template values.
+    Checks if a .env file exists and contains actual user-entered credentials,
+    not just the default template placeholders.
     """
     if not os.path.exists(filepath):
         return False
         
-    default_values = {
+    # These are the specific placeholder values we want to ignore.
+    placeholders = {
         "yourhkuid@connect.hku.hk",
         "your_password",
-        "your-own-super-long-and-secret-admin-key"
+        "your-own-super-long-and-secret-admin-key",
+        "paste_your_long_bearer_token_here",
+        "your_alert_target@example.com",
+        "your_gmail_account@gmail.com",
+        "your_16_character_gmail_app_password",
     }
     
-    with open(filepath, 'r') as f:
-        for line in f:
-            if '=' in line:
-                value = line.split('=', 1)[1].strip().strip('"').strip("'")
-                if value and value not in default_values:
-                    # Found a value that is not empty and not a default placeholder
-                    return True
+    # These are the only keys we care about to determine if the file is configured.
+    keys_to_check = [
+        "HKU_EMAIL", "HKU_PASSWORD", "ADMIN_API_KEY", 
+        "ALERT_EMAIL_TO", "ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"
+    ]
+
+    env_vars = {}
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key.strip()] = value.strip().strip('"').strip("'")
+    except IOError:
+        return False # Cannot read the file, so treat as not configured.
+
+    # Check if any of the critical keys have been filled with non-placeholder values.
+    for key in keys_to_check:
+        if key in env_vars and env_vars[key] and env_vars[key] not in placeholders:
+            # A key has a real value that isn't a placeholder.
+            return True
+            
+    # If we get here, no user-configurable keys have been changed.
     return False
 
 def create_env_file():
@@ -55,7 +79,7 @@ def create_env_file():
         overwrite = input("⚠️ A configured .env file already exists. Do you want to overwrite it with new settings? (y/n): ").lower()
         if overwrite != 'y':
             print("Skipping .env configuration.")
-            return True # Allow setup to continue without changing .env
+            return True
 
     env_content = []
     
@@ -97,7 +121,6 @@ def create_env_file():
         env_content.append('SMTP_SERVER="smtp.gmail.com"')
         env_content.append('SMTP_PORT=587')
     
-    # Initial Token (Optional)
     env_content.append('\n# --- Initial HKU Auth Token (Optional) ---')
     env_content.append('# This will be fetched automatically on the first run.')
     env_content.append('HKU_AUTH_TOKEN=""')
