@@ -183,4 +183,136 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="HKU ChatGPT Proxy", version="7.0.0", lifespan=lifespan)
 # Add CORS middleware to allow requests from any origin (e.g., web clients).
-app
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Helper function to protect admin endpoints with the ADMIN_API_KEY.
+def get_api_key(api_key: str = Security(API_KEY_HEADER)):
+    if api_key != app_state["admin_api_key"]:
+        raise HTTPException(status_code=403, detail="Invalid credentials")
+    return api_key
+
+# Helper function to stream the response back to the client.
+async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
+    try:
+        async for chunk in response.aiter_bytes():
+            yield chunk
+    except httpx.ReadError:
+        print("Stream ended.")
+    finally:
+        await response.aclose()
+
+# =================================================
+#           MAIN PROXY ENDPOINT
+# =================================================
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    """The main endpoint that mimics the OpenAI API."""
+    # If the token is missing on startup, try to fetch it once.
+    if not app_state["hku_auth_token"]:
+        token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
+        if not token:
+            raise HTTPException(status_code=401, detail="No HKU token available; initial login failed.")
+        app_state["hku_auth_token"] = token
+
+    req_payload = await request.json()
+    messages = req_payload.get("messages", [])
+    if not messages:
+        raise HTTPException(status_code=400, detail="Request must include messages.")
+    if not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": "You are an AI assistant that helps people find information."})
+    
+    deployment_id = req_payload.get("model", "gpt-4.1-nano")
+    
+    # Dynamically build the payload based on the model's requirements.
+    forward_payload = {
+        "messages": messages, "stream": True, "max_completion_tokens": req_payload.get("max_tokens", 2000)
+    }
+    if deployment_id in REASONING_MODELS:
+        forward_payload["temperature"] = req_payload.get("temperature", 1.0)
+        forward_payload["reasoning_effort"] = req_payload.get("reasoning_effort", "medium")
+    elif deployment_id in STANDARD_MODELS:
+        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
+        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
+    else: # Fallback for unknown models
+        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
+        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
+    
+    target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
+    headers = {
+        "accept": "text/event-stream", "authorization": f"Bearer {app_state['hku_auth_token']}",
+        "content-type": "application/json", "origin": "https://chatgpt.hku.hk", "referer": "https://chatgpt.hku.hk/",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
+            resp = await client.send(req, stream=True)
+            
+            # If the token is expired (401), try to refresh it once and retry the request.
+            if resp.status_code == 401:
+                print("[Proxy] HKU token likely expired—attempting on-demand refresh and retry.")
+                new_token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
+                if not new_token: raise HTTPException(status_code=401, detail="On-demand token refresh failed.")
+                app_state["hku_auth_token"] = new_token
+                headers["authorization"] = f"Bearer {new_token}"
+                req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
+                resp = await client.send(req, stream=True)
+            
+            resp.raise_for_status() # Raise an exception for any other bad status codes (4xx, 5xx).
+            
+            # Decide whether to stream or aggregate the response based on the client's request.
+            client_wants_stream = req_payload.get("stream", False)
+            if client_wants_stream:
+                return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
+            else:
+                content_chunks = []
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:") and "[DONE]" not in line:
+                        try:
+                            data = json.loads(line[6:])
+                            if "choices" in data and data["choices"]:
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content")
+                                if content: content_chunks.append(content)
+                        except json.JSONDecodeError: continue
+                
+                full_content = "".join(content_chunks)
+                await resp.aclose()
+                return JSONResponse({
+                    "id": f"chatcmpl-test-{os.urandom(8).hex()}", "object": "chat.completion",
+                    "created": int(__import__('time').time()), "model": deployment_id,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                })
+        except httpx.HTTPStatusError as e:
+            error_body = await e.response.aread()
+            raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
+
+# =================================================
+#           ADMIN & HEALTH ROUTES
+# =================================================
+@app.get("/health")
+async def health_check():
+    """A simple endpoint to check if the service is running."""
+    return {"status": "ok"}
+
+@app.post("/update-token")
+async def update_token(request: Request, api_key: str = Security(get_api_key)):
+    """Allows manual token updates, secured by the Admin API Key."""
+    data = await request.json()
+    new_token = data.get("token")
+    if not new_token:
+        raise HTTPException(status_code=400, detail="Payload must contain a 'token' field.")
+    app_state["hku_auth_token"] = new_token
+    return {"message": "Token updated successfully."}
+
+@app.post("/trigger-refresh")
+async def trigger_refresh(api_key: str = Security(get_api_key)):
+    """Manually triggers the automated token refresh process."""
+    token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
+    if token:
+        app_state["hku_auth_token"] = token
+        return {"status": "ok", "new_token_set": True}
+    return {"status": "fail"}
