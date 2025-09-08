@@ -35,8 +35,6 @@ async def fetch_hku_token_manual(email, password):
         token = None
         token_captured = asyncio.Event()
 
-        # --- BUG FIX SECTION ---
-        # The handler now correctly uses the 'request' object directly.
         async def intercept_request(request):
             nonlocal token
             if "completions" in request.url:
