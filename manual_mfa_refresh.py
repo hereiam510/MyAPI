@@ -2,7 +2,9 @@ import os
 import asyncio
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+
+# Import the shared token fetching function
+from token_fetcher import fetch_hku_token
 
 # --- CONFIGURATION SECTION ---
 load_dotenv()
@@ -10,49 +12,6 @@ HKU_EMAIL = os.getenv("HKU_EMAIL")
 HKU_PASSWORD = os.getenv("HKU_PASSWORD")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 PROXY_HOST = os.getenv("PROXY_HOST", "http://localhost:8000")
-
-# --- Playwright Token Fetcher ---
-async def fetch_hku_token_manual(email, password):
-    async with async_playwright() as p:
-        print("Opening Chromium browser in VISIBLE mode (not headless).")
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        await page.goto("https://chatgpt.hku.hk/")
-
-        print("""
-==============================================================================
-    ACTION REQUIRED: Please log in to the HKU service in the browser window.
-    
-    1. Complete the login and any Multi-Factor Authentication (MFA) steps.
-    2. Once you see the chat interface, send one message (e.g., "hello").
-    3. The script will then automatically capture the required token.
-==============================================================================
-""")
-        input("Press Enter to open the browser and begin...")
-        
-        token = None
-        token_captured = asyncio.Event()
-
-        async def intercept_request(request):
-            nonlocal token
-            if "completions" in request.url:
-                auth_header = request.headers.get("authorization")
-                if auth_header and auth_header.startswith("Bearer "):
-                    token = auth_header.split(" ")[1]
-                    token_captured.set()
-        
-        page.on("request", intercept_request)
-
-        try:
-            await asyncio.wait_for(token_captured.wait(), timeout=180) # 3-minute timeout
-            print("✅ New HKU Auth Token captured successfully!")
-        except asyncio.TimeoutError:
-            print("❌ Timeout: No token was captured. Did you fully log in and send a message?")
-        
-        await browser.close()
-        return token
 
 # --- Main logic ---
 async def main():
@@ -67,8 +26,21 @@ async def main():
 
     print(f"HKU Email: {HKU_EMAIL}")
     print(f"Using API backend: {PROXY_HOST}\n")
+    
+    print("""
+==============================================================================
+    ACTION REQUIRED: Please log in to the HKU service in the browser window.
+    
+    1. Complete the login and any Multi-Factor Authentication (MFA) steps.
+    2. Once you see the chat interface, send one message (e.g., "hello").
+    3. The script will then automatically capture the required token.
+==============================================================================
+""")
+    input("Press Enter to open the browser and begin...")
 
-    token = await fetch_hku_token_manual(HKU_EMAIL, HKU_PASSWORD)
+    # Use the shared function with the browser visible
+    token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD, headless=False)
+    
     if token:
         print("\n--- New HKU Auth Token Captured ---")
         print("Updating the running proxy backend...")
