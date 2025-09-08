@@ -109,12 +109,10 @@ def perform_initial_login(email, password):
     return asyncio.run(fetch_initial_token_async(email, password))
 
 def send_test_email(to_email, from_email, password, server, port):
-    """Attempts to send a test email and returns True on success, False on failure."""
+    """Attempts to send a test email with improved error handling."""
     subject = "[HKU Proxy] Email Alert System Test"
     body = "This is a test message from the HKU ChatGPT Proxy setup script.\n\nIf you received this, your email alert system is configured correctly."
     
-    # --- BUG FIX SECTION ---
-    # Explicitly create the message with UTF-8 encoding to prevent errors.
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['Subject'] = subject
     msg['From'] = from_email
@@ -128,14 +126,28 @@ def send_test_email(to_email, from_email, password, server, port):
         smtp_server.quit()
         print("✅ Test email sent successfully!")
         return True
+    # --- MODIFIED SECTION ---
+    # Added smarter error messages to diagnose the specific problem.
+    except smtplib.SMTPAuthenticationError:
+        print("❌ Failed to send test email. Error: Authentication failed.")
+        print("   Please double-check your 'From' email and your 16-character App Password.")
+        return False
+    except UnicodeEncodeError:
+        print("❌ Failed to send test email. Error: A non-standard character was detected.")
+        print("   This is often caused by copy-pasting. Please try typing your email and App Password manually.")
+        return False
     except Exception as e:
-        print(f"❌ Failed to send test email. Error: {e}")
+        print(f"❌ Failed to send test email. An unexpected error occurred: {e}")
         return False
 
 def create_env_file():
     """Interactively gathers user input and creates the .env file."""
     print("\n--- Configuring .env File ---")
     
+    if os.path.exists(".env"):
+        # We'll just overwrite to ensure a clean config run.
+        pass
+
     env_content = []
     
     print("\nPlease enter your HKU Portal credentials.")
@@ -188,9 +200,12 @@ def create_env_file():
             print("\nPlease provide your Gmail details for sending alerts.")
             print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
             print("See: https://support.google.com/accounts/answer/185833")
-            alert_to = input("Enter the email address where you want to RECEIVE alerts: ")
-            alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ")
-            alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ")
+            
+            # --- MODIFIED SECTION ---
+            # Automatically clean user input to remove common copy-paste errors.
+            alert_to = input("Enter the email address where you want to RECEIVE alerts: ").strip().replace('\xa0', '')
+            alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ").strip().replace('\xa0', '')
+            alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ").strip().replace('\xa0', '')
             
             print(f"\nAbout to send a test email to {alert_to}...")
             input("Press Enter to continue.")
@@ -223,6 +238,7 @@ def start_docker_service():
     if not run_command("docker-compose up --build -d", "Failed to build or start the Docker container."):
         return False
     
+    # ... (rest of the script is unchanged)
     config = {}
     if os.path.exists('.env'):
         with open('.env', 'r') as f:
