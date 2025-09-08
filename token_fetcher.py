@@ -36,24 +36,16 @@ async def fetch_hku_token(email, password, headless=True):
                 await page.click('button:has-text("Sign In")', timeout=10000)
                 await page.wait_for_load_state('networkidle', timeout=30000)
                 
-                # --- MODIFIED SECTION ---
-                # The login form is inside an iframe, so we target it directly.
-                logger.info("Locating login iframe.")
+                # Step 2: Target the iframe and enter the email
+                logger.info("Locating login iframe and entering email address.")
                 login_frame = page.frame_locator('iframe').first
+                await login_frame.get_by_label("Email, phone, or Skype").fill(email)
+                await login_frame.get_by_role("button", name="Next").click()
 
-                # Step 2: Enter email in the Microsoft login form (inside the iframe)
-                logger.info("Entering email address inside iframe.")
-                email_selector = 'input[type="email"]'
-                await login_frame.locator(email_selector).wait_for(timeout=30000)
-                await login_frame.locator(email_selector).fill(email)
-                await login_frame.locator('input[type="submit"]').click()
-
-                # Step 3: Enter password/PIN on the HKU login page (inside the iframe)
+                # Step 3: Enter password/PIN on the HKU login page (still in the iframe)
                 logger.info("Waiting for password page and entering password (PIN).")
-                password_selector = 'input[type="password"]'
-                await login_frame.locator(password_selector).wait_for(timeout=30000)
-                await login_frame.locator(password_selector).fill(password)
-                await login_frame.locator('input[type="submit"], button:has-text("Sign in"), button:has-text("登入")').click()
+                await login_frame.get_by_placeholder("PIN").fill(password)
+                await login_frame.get_by_role("button", name="Sign in").click()
 
                 # Step 4: Wait for the final redirect back to the chat interface
                 logger.info("Login submitted, waiting for main chat page to load.")
