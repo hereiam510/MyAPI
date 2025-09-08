@@ -1,8 +1,8 @@
-# main.py
 import os
 import asyncio
 import json
 import httpx
+import time
 from fastapi import FastAPI, Request, HTTPException, Security
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader
@@ -24,8 +24,8 @@ TOKEN_REFRESH_INTERVAL_MINUTES = int(os.getenv("TOKEN_REFRESH_INTERVAL_MINUTES",
 app_state = {
     "hku_auth_token": os.getenv("HKU_AUTH_TOKEN"),
     "admin_api_key": os.getenv("ADMIN_API_KEY"),
-    "background_task": None, # To hold our background task
-    "is_paused": asyncio.Event(), # Event to pause/resume the background task
+    "background_task": None,
+    "is_paused": asyncio.Event(),
 }
 
 HKU_API_BASE_URL = "https://api.hku.hk"
@@ -128,11 +128,9 @@ async def refresh_token_background_loop(app_state):
     failure_count = 0
     
     while True:
-        # If the task is paused (due to MFA alert), wait here indefinitely.
         if app_state["is_paused"].is_set():
             print("[TokenRefresh] Paused. Waiting for manual token update...")
             await app_state["is_paused"].wait()
-            # Once wait() returns, it means the event was cleared. Reset and continue.
             print("[TokenRefresh] Resuming automatic refresh.")
             failure_count = 0
 
@@ -144,26 +142,23 @@ async def refresh_token_background_loop(app_state):
                 app_state["hku_auth_token"] = token
                 print("[TokenRefresh] Token updated successfully.")
                 failure_count = 0
-                # On success, wait for the standard long interval.
                 await asyncio.sleep(TOKEN_REFRESH_INTERVAL_MINUTES * 60)
             else:
                 print(f"[TokenRefresh] Failed to get new token (Attempt #{failure_count + 1}).")
                 failure_count += 1
                 
                 if failure_count <= len(failure_intervals):
-                    # Use the short retry intervals first.
                     wait_time = failure_intervals[failure_count - 1] * 60
                     print(f"[TokenRefresh] Retrying in {wait_time / 60} minute(s).")
                     await asyncio.sleep(wait_time)
                 else:
-                    # After all rapid retries fail, send alert and pause.
                     print("[TokenRefresh] All retry attempts failed. This may be an MFA issue.")
                     send_mfa_alert("All automated refresh attempts failed.")
-                    app_state["is_paused"].set() # Set the event to pause the loop.
+                    app_state["is_paused"].set()
 
         except Exception as e:
             print(f"[TokenRefresh] An unexpected error occurred: {e}")
-            await asyncio.sleep(60) # Wait a minute before retrying on an exception.
+            await asyncio.sleep(60)
 
 # =================================================
 #           FASTAPI LIFESPAN & APP DEFINITION
@@ -270,7 +265,6 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
     if not new_token: raise HTTPException(status_code=400, detail="Payload must contain a 'token' field.")
     
     app_state["hku_auth_token"] = new_token
-    # If the background task was paused, this manual update will resume it.
     if app_state["is_paused"].is_set():
         app_state["is_paused"].clear()
     
