@@ -84,8 +84,13 @@ def create_env_file():
     env_content.append(f'HKU_EMAIL="{hku_email}"')
     env_content.append(f'HKU_PASSWORD="{hku_password}"')
 
-    print("\nPlease set an Admin API Key to secure the proxy's admin endpoints.")
+    # --- MODIFIED SECTION ---
+    # Added a forewarning about the importance of the Admin API Key.
+    print("\nNext, you will set an Admin API Key.")
+    print("This key is required to use the manual MFA refresh script.")
+    print("You can provide your own, or leave the next prompt blank to generate a secure random one.")
     admin_key = input("Enter your desired Admin API Key (leave blank to generate a random one): ")
+    
     if not admin_key:
         admin_key = secrets.token_hex(32)
         print("\n==================================================================")
@@ -109,9 +114,6 @@ def create_env_file():
         print("\nPlease provide your Gmail details for sending alerts.")
         print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
         print("See: https://support.google.com/accounts/answer/185833")
-        
-        # --- MODIFIED LINES ---
-        # Clarified the purpose of each email address prompt.
         alert_to = input("Enter the email address where you want to RECEIVE alerts: ")
         alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ")
         alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ")
