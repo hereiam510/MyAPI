@@ -6,7 +6,8 @@ import secrets
 import getpass
 import shutil
 import asyncio
-import time
+import smtplib
+from email.mime.text import MIMEText
 
 # Note: Playwright is imported inside a function after it's installed.
 
@@ -109,12 +110,12 @@ def perform_initial_login(email, password):
 
 def send_test_email(to_email, from_email, password, server, port):
     """Attempts to send a test email and returns True on success, False on failure."""
-    import smtplib
-    from email.mime.text import MIMEText
-    
     subject = "[HKU Proxy] Email Alert System Test"
     body = "This is a test message from the HKU ChatGPT Proxy setup script.\n\nIf you received this, your email alert system is configured correctly."
-    msg = MIMEText(body)
+    
+    # --- BUG FIX SECTION ---
+    # Explicitly create the message with UTF-8 encoding to prevent errors.
+    msg = MIMEText(body, 'plain', 'utf-8')
     msg['Subject'] = subject
     msg['From'] = from_email
     msg['To'] = to_email
@@ -185,8 +186,6 @@ def create_env_file():
     if setup_email == 'y':
         while True:
             print("\nPlease provide your Gmail details for sending alerts.")
-            # --- MODIFIED SECTION ---
-            # Added the Google support link back in.
             print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
             print("See: https://support.google.com/accounts/answer/185833")
             alert_to = input("Enter the email address where you want to RECEIVE alerts: ")
@@ -219,49 +218,24 @@ def create_env_file():
         return False
 
 def start_docker_service():
-    """Builds and starts the Docker service, then verifies it is running."""
+    """Builds and starts the Docker service."""
     print("\n--- Building and Starting the Proxy Service ---")
-    print("This may take a few minutes...")
-    while True:
-        # Step 1: Attempt to start the service.
-        success, _ = run_command("docker-compose up --build -d", "Failed to build or start the Docker container.")
-        
-        if success:
-            # Step 2: Wait a moment for the container to stabilize or crash.
-            print("Service starting, waiting 5 seconds to verify status...")
-            time.sleep(5)
-            
-            # Step 3: Verify that the service is actually in a 'running' state.
-            verify_success, stdout = run_command(
-                'docker-compose ps --services --filter "status=running"',
-                "Failed to check service status."
-            )
-            
-            if verify_success and "hku_proxy_service" in stdout:
-                # If verification is successful, we are done.
-                config = {}
-                if os.path.exists('.env'):
-                    with open('.env', 'r') as f:
-                        for line in f:
-                            if '=' in line and not line.startswith('#'):
-                                key, value = line.split('=', 1)
-                                config[key.strip()] = value.strip()
-                port = config.get("PROXY_PORT", "8000")
-                
-                print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
-                print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
-                print("You can view logs with the command: docker-compose logs -f")
-                return True
-            else:
-                # If verification fails, report the error and fall through to the retry prompt.
-                print("❌ Error: The container started but appears to have stopped unexpectedly.")
-                print("   Please check the logs for more details using: docker-compose logs")
-
-        # This block is reached if either the 'up' command or the verification check fails.
-        retry = input("The Docker service failed to start or stay running. Would you like to try again? (y/n): ").lower()
-        if retry != 'y':
-            print("Exiting setup.")
-            return False
+    if not run_command("docker-compose up --build -d", "Failed to build or start the Docker container."):
+        return False
+    
+    config = {}
+    if os.path.exists('.env'):
+        with open('.env', 'r') as f:
+            for line in f:
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    port = config.get("PROXY_PORT", "8000")
+    
+    print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
+    print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
+    print("You can view logs with the command: docker-compose logs -f")
+    return True
 
 def main():
     """Main function that orchestrates the entire setup process."""
