@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 async def fetch_hku_token(email, password, headless=True):
     """
     Launches a Playwright browser to log into the HKU service and capture the auth token.
-    This version handles the multi-step redirect login flow.
+    This version handles the multi-step redirect login flow with explicit waits.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -35,27 +35,32 @@ async def fetch_hku_token(email, password, headless=True):
                 logger.info("Clicking the initial 'Sign In' button.")
                 await page.click('button:has-text("Sign In")', timeout=10000)
 
-                # --- MODIFIED SECTION ---
-                # We no longer wait for a pop-up. We assume the current page navigates
-                # to the Microsoft login page. All actions are now on the 'page' object.
+                # --- ADDED WAIT ---
+                # Wait for the redirect to the Microsoft login page to complete
+                logger.info("Waiting for redirect to Microsoft login page...")
+                await page.wait_for_load_state('networkidle', timeout=30000)
                 
                 # Step 2: Enter email in the Microsoft login form
-                logger.info("Waiting for email page to load and entering email address.")
+                logger.info("Entering email address.")
                 email_selector = 'input[type="email"]'
-                # Increased timeout to allow for page redirect
                 await page.wait_for_selector(email_selector, timeout=30000)
                 await page.fill(email_selector, email)
                 await page.click('input[type="submit"]')
 
+                # --- ADDED WAIT ---
+                # Wait for the redirect to the HKU password page to complete
+                logger.info("Waiting for redirect to HKU password page...")
+                await page.wait_for_load_state('networkidle', timeout=30000)
+
                 # Step 3: Enter password/PIN on the HKU login page
-                logger.info("Waiting for password page to load and entering password (PIN).")
+                logger.info("Entering password (PIN).")
                 password_selector = 'input[type="password"]'
                 await page.wait_for_selector(password_selector, timeout=30000)
                 await page.fill(password_selector, password)
                 await page.click('input[type="submit"], button:has-text("Sign in"), button:has-text("登入")')
 
-                # Step 4: Wait for the main page to load the chat interface
-                logger.info("Login submitted, waiting for main page to load.")
+                # Step 4: Wait for the final redirect back to the chat interface
+                logger.info("Login submitted, waiting for main chat page to load.")
                 await page.wait_for_load_state('networkidle', timeout=45000)
                 await asyncio.sleep(4)
 
