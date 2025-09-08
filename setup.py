@@ -10,7 +10,8 @@ import time
 import smtplib
 from email.mime.text import MIMEText
 
-# Note: Playwright is imported inside functions after it's installed.
+# Import the shared token fetching function
+from token_fetcher import fetch_hku_token
 
 def run_command(command, error_message, capture_stdout=False):
     """Runs a command and handles success/failure, printing detailed errors."""
@@ -61,37 +62,6 @@ def install_local_dependencies():
     print("✅ Playwright browsers installed.")
     return True
 
-async def fetch_initial_token_async(email, password):
-    """The core async logic for fetching the token with Playwright."""
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
-        await page.goto("https://chatgpt.hku.hk/")
-        token = None
-        token_captured = asyncio.Event()
-
-        async def intercept_request(request):
-            nonlocal token
-            if "completions" in request.url:
-                auth_header = request.headers.get("authorization")
-                if auth_header and auth_header.startswith("Bearer "):
-                    token = auth_header.split(" ")[1]
-                    token_captured.set()
-        
-        page.on("request", intercept_request)
-
-        try:
-            await asyncio.wait_for(token_captured.wait(), timeout=180)
-            print("✅ Initial HKU Auth Token captured successfully!")
-        except asyncio.TimeoutError:
-            print("❌ Timeout: No token was captured. Did you fully log in and send a message?")
-        
-        await browser.close()
-        return token
-
 def perform_initial_login(email, password):
     """Wrapper to run the async token fetching logic."""
     print("\n--- Initial Token Acquisition ---")
@@ -107,7 +77,8 @@ def perform_initial_login(email, password):
 ==============================================================================
 """)
     input("Press Enter to open the browser and begin...")
-    return asyncio.run(fetch_initial_token_async(email, password))
+    # Use the shared function with the browser visible
+    return asyncio.run(fetch_hku_token(email, password, headless=False))
 
 def send_test_email(to_email, from_email, password, server, port):
     """Attempts to send a test email and returns True on success, False on failure."""
