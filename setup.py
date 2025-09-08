@@ -6,10 +6,11 @@ import secrets
 import getpass
 import shutil
 import asyncio
+import time
 import smtplib
 from email.mime.text import MIMEText
 
-# Note: Playwright is imported inside a function after it's installed.
+# Note: Playwright is imported inside functions after it's installed.
 
 def run_command(command, error_message, capture_stdout=False):
     """Runs a command and handles success/failure, printing detailed errors."""
@@ -109,7 +110,7 @@ def perform_initial_login(email, password):
     return asyncio.run(fetch_initial_token_async(email, password))
 
 def send_test_email(to_email, from_email, password, server, port):
-    """Attempts to send a test email with improved error handling."""
+    """Attempts to send a test email and returns True on success, False on failure."""
     subject = "[HKU Proxy] Email Alert System Test"
     body = "This is a test message from the HKU ChatGPT Proxy setup script.\n\nIf you received this, your email alert system is configured correctly."
     
@@ -126,27 +127,62 @@ def send_test_email(to_email, from_email, password, server, port):
         smtp_server.quit()
         print("✅ Test email sent successfully!")
         return True
-    # --- MODIFIED SECTION ---
-    # Added smarter error messages to diagnose the specific problem.
     except smtplib.SMTPAuthenticationError:
         print("❌ Failed to send test email. Error: Authentication failed.")
         print("   Please double-check your 'From' email and your 16-character App Password.")
-        return False
-    except UnicodeEncodeError:
-        print("❌ Failed to send test email. Error: A non-standard character was detected.")
-        print("   This is often caused by copy-pasting. Please try typing your email and App Password manually.")
         return False
     except Exception as e:
         print(f"❌ Failed to send test email. An unexpected error occurred: {e}")
         return False
 
+def is_env_file_configured(filepath=".env"):
+    """
+    Checks if a .env file exists and contains actual user-entered credentials,
+    not just the default template placeholders.
+    """
+    if not os.path.exists(filepath):
+        return False
+        
+    placeholders = {
+        "yourhkuid@connect.hku.hk", "your_password",
+        "your-own-super-long-and-secret-admin-key", "paste_your_long_bearer_token_here",
+        "your_alert_target@example.com", "your_gmail_account@gmail.com",
+        "your_16_character_gmail_app_password",
+    }
+    
+    keys_to_check = [
+        "HKU_EMAIL", "HKU_PASSWORD", "ADMIN_API_KEY", 
+        "ALERT_EMAIL_TO", "ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"
+    ]
+    env_vars = {}
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key.strip()] = value.strip().strip('"').strip("'")
+    except IOError:
+        return False
+
+    for key in keys_to_check:
+        if key in env_vars and env_vars[key] and env_vars[key] not in placeholders:
+            return True
+            
+    return False
+
 def create_env_file():
     """Interactively gathers user input and creates the .env file."""
     print("\n--- Configuring .env File ---")
     
-    if os.path.exists(".env"):
-        # We'll just overwrite to ensure a clean config run.
-        pass
+    # --- BUG FIX SECTION ---
+    # The safety check to prevent accidental overwrites has been restored.
+    if is_env_file_configured(".env"):
+        overwrite = input("⚠️ A configured .env file already exists. Do you want to overwrite it with new settings? (y/n): ").lower()
+        if overwrite != 'y':
+            print("Skipping .env configuration.")
+            return True
 
     env_content = []
     
@@ -198,11 +234,8 @@ def create_env_file():
     if setup_email == 'y':
         while True:
             print("\nPlease provide your Gmail details for sending alerts.")
-            print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
+            print("NOTE: You must use a 16-character 'App Password' from Google.")
             print("See: https://support.google.com/accounts/answer/185833")
-            
-            # --- MODIFIED SECTION ---
-            # Automatically clean user input to remove common copy-paste errors.
             alert_to = input("Enter the email address where you want to RECEIVE alerts: ").strip().replace('\xa0', '')
             alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ").strip().replace('\xa0', '')
             alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ").strip().replace('\xa0', '')
@@ -233,25 +266,43 @@ def create_env_file():
         return False
 
 def start_docker_service():
-    """Builds and starts the Docker service."""
+    """Builds and starts the Docker service, then verifies it is running."""
     print("\n--- Building and Starting the Proxy Service ---")
-    if not run_command("docker-compose up --build -d", "Failed to build or start the Docker container."):
-        return False
-    
-    # ... (rest of the script is unchanged)
-    config = {}
-    if os.path.exists('.env'):
-        with open('.env', 'r') as f:
-            for line in f:
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    config[key.strip()] = value.strip()
-    port = config.get("PROXY_PORT", "8000")
-    
-    print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
-    print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
-    print("You can view logs with the command: docker-compose logs -f")
-    return True
+    print("This may take a few minutes...")
+    while True:
+        success, _ = run_command("docker-compose up --build -d", "Failed to build or start the Docker container.")
+        
+        if success:
+            print("Service starting, waiting 5 seconds to verify status...")
+            time.sleep(5)
+            
+            verify_success, stdout = run_command(
+                'docker-compose ps --services --filter "status=running"',
+                "Failed to check service status."
+            )
+            
+            if verify_success and "hku_proxy_service" in stdout:
+                config = {}
+                if os.path.exists('.env'):
+                    with open('.env', 'r') as f:
+                        for line in f:
+                            if '=' in line and not line.startswith('#'):
+                                key, value = line.split('=', 1)
+                                config[key.strip()] = value.strip()
+                port = config.get("PROXY_PORT", "8000")
+                
+                print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
+                print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
+                print("You can view logs with the command: docker-compose logs -f")
+                return True
+            else:
+                print("❌ Error: The container started but appears to have stopped unexpectedly.")
+                print("   Please check the logs for more details using: docker-compose logs")
+
+        retry = input("The Docker service failed to start or stay running. Would you like to try again? (y/n): ").lower()
+        if retry != 'y':
+            print("Exiting setup.")
+            return False
 
 def main():
     """Main function that orchestrates the entire setup process."""
