@@ -57,38 +57,43 @@ async def fetch_initial_token(email, password):
     Launches a VISIBLE browser window for the user to perform the initial login and MFA.
     Captures and returns the first auth token.
     """
-    async with async_playwright() as p:
-        print("\n--- Initial Token Acquisition ---")
-        print("A browser window will now open.")
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        await page.goto("https://chatgpt.hku.hk/")
-
-        print("""
+    print("\n--- Initial Token Acquisition ---")
+    # --- MODIFIED SECTION ---
+    # Instructions are now shown BEFORE the browser opens.
+    print("""
 ==============================================================================
-    ACTION REQUIRED: Please log in to the HKU service in the browser window.
+    ACTION REQUIRED IN THE NEXT STEP:
+    
+    A browser window will open. Please log in to the HKU service.
     
     1. Complete the login and any Multi-Factor Authentication (MFA) steps.
     2. Once you see the chat interface, send one message (e.g., "hello").
     3. The script will then automatically capture the required token.
 ==============================================================================
 """)
+    input("Press Enter to open the browser and begin...")
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        await page.goto("https://chatgpt.hku.hk/")
+
         token = None
         token_captured = asyncio.Event()
 
-        async def intercept_request(route):
+        # --- BUG FIX SECTION ---
+        # The handler now correctly uses the 'request' object directly.
+        async def intercept_request(request):
             nonlocal token
-            request = route.request
             if "completions" in request.url:
-                auth = request.headers.get("authorization")
-                if auth and auth.startswith("Bearer "):
-                    token = auth.split("Bearer ")[1]
+                auth_header = request.headers.get("authorization")
+                if auth_header and auth_header.startswith("Bearer "):
+                    token = auth_header.split(" ")[1]
                     token_captured.set()
-            await route.continue_()
         
-        page.on("request", lambda req: asyncio.create_task(intercept_request(req)))
+        page.on("request", intercept_request)
 
         try:
             await asyncio.wait_for(token_captured.wait(), timeout=180) # 3-minute timeout
@@ -131,8 +136,6 @@ def create_env_file():
     
     proxy_host = f"http://localhost:{proxy_port}"
     
-    # --- MODIFIED SECTION ---
-    # Perform initial login to get the first token.
     initial_token = asyncio.run(fetch_initial_token(hku_email, hku_password))
     if not initial_token:
         print("❌ Could not get initial token. It will be fetched when the service starts.")
@@ -196,8 +199,6 @@ def main():
     print("=====================================================")
     
     if not check_prerequisites(): sys.exit(1)
-    # --- MODIFIED ORDER ---
-    # Install dependencies first, so we can use Playwright in the next step.
     if not install_local_dependencies(): sys.exit(1)
     if not create_env_file(): sys.exit(1)
     if not start_docker_service(): sys.exit(1)
