@@ -2,7 +2,7 @@
 import os
 import asyncio
 import logging
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,6 @@ async def fetch_hku_token(email, password, headless=True):
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=headless,
-            # This is the fix: slow_mo is off during manual runs, making the browser responsive.
             slow_mo=50 if headless else None,
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
         )
@@ -40,26 +39,38 @@ async def fetch_hku_token(email, password, headless=True):
         page.on("request", intercept_request)
 
         try:
-            # --- LOGIC FOR AUTOMATED (HEADLESS) MODE ---
             if headless:
-                # Check if already logged in by looking for the textarea
                 is_logged_in = await page.locator('textarea').is_visible(timeout=10000)
                 
                 if not is_logged_in:
                     logger.info("Not logged in. Starting the full automated login process.")
-                    await page.click('button:has-text("Sign In")', timeout=20000)
-                    await page.wait_for_load_state('networkidle', timeout=30000)
                     
-                    login_frame = page.frame_locator('iframe').first
-                    await login_frame.locator('input[type="email"]').fill(email)
-                    await login_frame.locator('input[type="submit"]').click()
+                    logger.info("Waiting for login pop-up window...")
+                    async with page.expect_popup() as popup_info:
+                        await page.click('button:has-text("Sign In")', timeout=20000)
                     
-                    await login_frame.locator('input[type="password"]').wait_for(timeout=30000)
-                    await login_frame.locator('input[type="password"]').fill(password)
-                    await login_frame.locator('input[type="submit"], button:has-text("Sign in")').click()
+                    login_page = await popup_info.value
+                    await login_page.wait_for_load_state('networkidle', timeout=60000)
+                    logger.info("Pop-up window detected. Proceeding with Microsoft login.")
+
+                    # Microsoft email page
+                    await login_page.locator('input[type="email"]').fill(email)
+                    await login_page.locator('input[type="submit"]').click()
+                    logger.info("Email submitted. Waiting for HKU password page.")
+
+                    # --- FINAL FIX ---
+                    # Use specific selectors for the HKU password page based on screenshots.
+                    # This is more robust than general selectors.
+                    # Wait for the password input with ID 'passwordInput' and fill it.
+                    await login_page.locator("#passwordInput").fill(password)
+                    # Click the sign-in button with ID 'submitButton'.
+                    await login_page.locator("#submitButton").click()
+                    # --- END FINAL FIX ---
                     
-                    logger.info("Login submitted. Waiting for final redirect.")
-                    await page.wait_for_load_state('networkidle', timeout=60000)
+                    logger.info("Password submitted. Waiting for login to complete.")
+                    await page.wait_for_load_state('networkidle', timeout=90000) # Increased timeout for safety
+                    logger.info("Login complete. Main page has loaded.")
+
                 else:
                     logger.info("Session is already active. Skipping login steps.")
 
@@ -67,17 +78,15 @@ async def fetch_hku_token(email, password, headless=True):
                 await page.locator('textarea').fill('Hello')
                 await page.locator('textarea').press('Enter')
 
-            # --- LOGIC FOR MANUAL (NON-HEADLESS) MODE ---
             else:
                 logger.info("Browser is open. Please complete the login and MFA process manually.")
                 logger.info("The script will wait until a token is captured.")
 
-            # Universal token waiting logic for both modes
             await asyncio.wait_for(token_captured.wait(), timeout=None if not headless else 180)
             logger.info("✅ HKU Auth Token captured successfully!")
 
         except Exception as e:
-            if headless: # Only save screenshot in automated mode
+            if headless:
                 await page.screenshot(path="debug_screenshot.png")
             logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
             return None
