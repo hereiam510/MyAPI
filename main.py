@@ -10,9 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from typing import Dict, Any, AsyncGenerator
-from playwright.async_api import async_playwright
 import smtplib
 from email.mime.text import MIMEText
+
+# Import the shared token fetching function
+from token_fetcher import fetch_hku_token
 
 # =================================================
 #           CONFIGURATION SECTION
@@ -78,48 +80,6 @@ def send_mfa_alert(reason="MFA intervention required."):
         return False
 
 # =================================================
-#           PLAYWRIGHT HKU LOGIN/TOKEN FUNCTION
-# =================================================
-async def fetch_hku_token(email, password):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
-        await page.goto("https://chatgpt.hku.hk/")
-        try:
-            await page.wait_for_selector('input[type="email"],input[name="username"]', timeout=10000)
-            await page.fill('input[type="email"],input[name="username"]', email)
-            await page.click('button[type="submit"],input[type="submit"]')
-        except Exception: pass
-        try:
-            await page.wait_for_selector('input[type="password"]', timeout=10000)
-            await page.fill('input[type="password"]', password)
-            await page.click('button[type="submit"],input[type="submit"]')
-        except Exception: pass
-
-        await page.wait_for_load_state('networkidle', timeout=30000)
-        await asyncio.sleep(4)
-        token = None
-        
-        async def intercept_request(request):
-            nonlocal token
-            if "completions" in request.url:
-                auth = request.headers.get("authorization")
-                if auth and auth.startswith("Bearer "):
-                    token = auth.split("Bearer ")[1]
-        page.on("request", intercept_request)
-
-        try:
-            await page.fill('textarea', 'Hello')
-            await page.keyboard.press('Enter')
-            await asyncio.sleep(4)
-        except Exception:
-            await asyncio.sleep(8)
-        
-        await browser.close()
-        return token
-
-# =================================================
 #           INTELLIGENT TOKEN AUTO-REFRESH LOGIC
 # =================================================
 async def refresh_token_background_loop(app_state):
@@ -136,7 +96,8 @@ async def refresh_token_background_loop(app_state):
 
         try:
             print(f"[TokenRefresh] Attempting to auto-refresh HKU token.")
-            token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD)
+            # Use the shared function in headless mode
+            token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD, headless=True)
             
             if token:
                 app_state["hku_auth_token"] = token
