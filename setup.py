@@ -6,32 +6,32 @@ import secrets
 import getpass
 import shutil
 import asyncio
+import time
 
-# Note: Playwright and other dependencies are imported inside functions
-# after they have been installed.
+# Note: Playwright is imported inside a function after it's installed.
 
-def run_command(command, error_message):
-    """Runs a command and exits if it fails, printing the detailed error."""
+def run_command(command, error_message, capture_stdout=False):
+    """Runs a command and handles success/failure, printing detailed errors."""
     try:
         process = subprocess.run(command, check=True, shell=True, capture_output=True, text=True)
-        return True
+        return True, process.stdout
     except subprocess.CalledProcessError as e:
         print(f"❌ Error: {error_message}")
         print("\n--- Command Output (Error) ---")
         print(e.stderr)
         print("------------------------------")
-        return False
+        return False, e.stderr
     except FileNotFoundError:
         print(f"❌ Error: {error_message}")
-        return False
+        return False, ""
 
 def check_prerequisites():
     """Checks if Docker and Docker Compose are installed."""
     print("--- Checking Prerequisites ---")
-    if not run_command("docker --version", "Docker is not installed or not in your PATH. Please install it to continue."):
-        return False
-    if not run_command("docker-compose --version", "Docker Compose is not installed or not in your PATH. Please install it to continue."):
-        return False
+    success, _ = run_command("docker --version", "Docker is not installed or not in your PATH.")
+    if not success: return False
+    success, _ = run_command("docker-compose --version", "Docker Compose is not installed or not in your PATH.")
+    if not success: return False
     print("✅ Docker and Docker Compose are installed.")
     return True
 
@@ -50,20 +50,17 @@ def install_local_dependencies():
         install_cmd = "uv pip install -r requirements.txt"
 
     error_msg = f"Failed to install Python packages using `{installer}`."
-    if not run_command(install_cmd, error_msg):
-        return False
+    success, _ = run_command(install_cmd, error_msg)
+    if not success: return False
     print("✅ Python packages installed.")
     
-    if not run_command("playwright install", "Failed to install Playwright browsers."):
-        return False
+    success, _ = run_command("playwright install", "Failed to install Playwright browsers.")
+    if not success: return False
     print("✅ Playwright browsers installed.")
     return True
 
 async def fetch_initial_token_async(email, password):
-    """
-    The core async logic for fetching the token with Playwright.
-    This is called by a wrapper function after playwright is imported.
-    """
+    """The core async logic for fetching the token with Playwright."""
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
@@ -85,7 +82,7 @@ async def fetch_initial_token_async(email, password):
         page.on("request", intercept_request)
 
         try:
-            await asyncio.wait_for(token_captured.wait(), timeout=180) # 3-minute timeout
+            await asyncio.wait_for(token_captured.wait(), timeout=180)
             print("✅ Initial HKU Auth Token captured successfully!")
         except asyncio.TimeoutError:
             print("❌ Timeout: No token was captured. Did you fully log in and send a message?")
@@ -109,6 +106,30 @@ def perform_initial_login(email, password):
 """)
     input("Press Enter to open the browser and begin...")
     return asyncio.run(fetch_initial_token_async(email, password))
+
+def send_test_email(to_email, from_email, password, server, port):
+    """Attempts to send a test email and returns True on success, False on failure."""
+    import smtplib
+    from email.mime.text import MIMEText
+    
+    subject = "[HKU Proxy] Email Alert System Test"
+    body = "This is a test message from the HKU ChatGPT Proxy setup script.\n\nIf you received this, your email alert system is configured correctly."
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = from_email
+    msg['To'] = to_email
+
+    try:
+        smtp_server = smtplib.SMTP(server, port)
+        smtp_server.starttls()
+        smtp_server.login(from_email, password)
+        smtp_server.sendmail(from_email, to_email, msg.as_string())
+        smtp_server.quit()
+        print("✅ Test email sent successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to send test email. Error: {e}")
+        return False
 
 def create_env_file():
     """Interactively gathers user input and creates the .env file."""
@@ -134,15 +155,59 @@ def create_env_file():
         print("==================================================================")
         input("Press Enter to continue after you have saved the key...")
     env_content.append(f'ADMIN_API_KEY="{admin_key}"')
-    
+
     initial_token = perform_initial_login(hku_email, hku_password)
     if not initial_token:
-        print("❌ Could not get initial token. It will be fetched when the service starts.")
-    
+        print("⚠️  Could not get initial token. The service will try to fetch it on its first run.")
+
     env_content.append('\n# --- Initial HKU Auth Token ---')
     env_content.append(f'HKU_AUTH_TOKEN="{initial_token or ""}"')
     
-    # ... (rest of the function is the same, no changes needed here)
+    print("\nPlease choose a port for the proxy service.")
+    proxy_port = input("Enter the port number [default: 8000]: ")
+    if not proxy_port.isdigit():
+        proxy_port = "8000"
+    
+    proxy_host = f"http://localhost:{proxy_port}"
+
+    print("\nPlease specify the token auto-renewal interval in minutes.")
+    refresh_interval = input("Enter the refresh interval in minutes [default: 15]: ")
+    if not refresh_interval.isdigit():
+        refresh_interval = "15"
+    
+    env_content.append("\n# --- Auto-Renewal & Alert Settings ---")
+    env_content.append(f"TOKEN_REFRESH_INTERVAL_MINUTES={refresh_interval}")
+    env_content.append("EMAIL_ALERT_FAILURES=3")
+    env_content.append(f'PROXY_PORT={proxy_port}')
+    env_content.append(f'PROXY_HOST="{proxy_host}"')
+    
+    setup_email = input("\nDo you want to set up email alerts for MFA notifications? (y/n): ").lower()
+    if setup_email == 'y':
+        while True:
+            print("\nPlease provide your Gmail details for sending alerts.")
+            # --- MODIFIED SECTION ---
+            # Added the Google support link back in.
+            print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
+            print("See: https://support.google.com/accounts/answer/185833")
+            alert_to = input("Enter the email address where you want to RECEIVE alerts: ")
+            alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ")
+            alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ")
+            
+            print(f"\nAbout to send a test email to {alert_to}...")
+            input("Press Enter to continue.")
+            if send_test_email(alert_to, alert_from, alert_password, "smtp.gmail.com", 587):
+                env_content.append("\n# --- EMAIL ALERT SETTINGS (for Gmail App Password) ---")
+                env_content.append(f'ALERT_EMAIL_TO="{alert_to}"')
+                env_content.append(f'ALERT_EMAIL_FROM="{alert_from}"')
+                env_content.append(f'ALERT_EMAIL_PASSWORD="{alert_password}"')
+                env_content.append('SMTP_SERVER="smtp.gmail.com"')
+                env_content.append('SMTP_PORT=587')
+                break
+            else:
+                retry = input("Would you like to re-enter your email settings? (y/n): ").lower()
+                if retry != 'y':
+                    print("⚠️ Email alerts will be disabled.")
+                    break
 
     try:
         with open(".env", "w") as f:
@@ -154,24 +219,49 @@ def create_env_file():
         return False
 
 def start_docker_service():
-    """Builds and starts the Docker service."""
+    """Builds and starts the Docker service, then verifies it is running."""
     print("\n--- Building and Starting the Proxy Service ---")
-    if not run_command("docker-compose up --build -d", "Failed to build or start the Docker container."):
-        return False
-    
-    config = {}
-    if os.path.exists('.env'):
-        with open('.env', 'r') as f:
-            for line in f:
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    config[key.strip()] = value.strip()
-    port = config.get("PROXY_PORT", "8000")
-    
-    print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
-    print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
-    print("You can view logs with the command: docker-compose logs -f")
-    return True
+    print("This may take a few minutes...")
+    while True:
+        # Step 1: Attempt to start the service.
+        success, _ = run_command("docker-compose up --build -d", "Failed to build or start the Docker container.")
+        
+        if success:
+            # Step 2: Wait a moment for the container to stabilize or crash.
+            print("Service starting, waiting 5 seconds to verify status...")
+            time.sleep(5)
+            
+            # Step 3: Verify that the service is actually in a 'running' state.
+            verify_success, stdout = run_command(
+                'docker-compose ps --services --filter "status=running"',
+                "Failed to check service status."
+            )
+            
+            if verify_success and "hku_proxy_service" in stdout:
+                # If verification is successful, we are done.
+                config = {}
+                if os.path.exists('.env'):
+                    with open('.env', 'r') as f:
+                        for line in f:
+                            if '=' in line and not line.startswith('#'):
+                                key, value = line.split('=', 1)
+                                config[key.strip()] = value.strip()
+                port = config.get("PROXY_PORT", "8000")
+                
+                print("\n🎉 Success! The HKU ChatGPT Proxy is now running in the background.")
+                print(f"Your OpenAI-compatible endpoint is available at: http://localhost:{port}")
+                print("You can view logs with the command: docker-compose logs -f")
+                return True
+            else:
+                # If verification fails, report the error and fall through to the retry prompt.
+                print("❌ Error: The container started but appears to have stopped unexpectedly.")
+                print("   Please check the logs for more details using: docker-compose logs")
+
+        # This block is reached if either the 'up' command or the verification check fails.
+        retry = input("The Docker service failed to start or stay running. Would you like to try again? (y/n): ").lower()
+        if retry != 'y':
+            print("Exiting setup.")
+            return False
 
 def main():
     """Main function that orchestrates the entire setup process."""
@@ -180,11 +270,7 @@ def main():
     print("=====================================================")
     
     if not check_prerequisites(): sys.exit(1)
-    
-    # --- MODIFIED ORDER ---
-    # Install dependencies first, so we can import and use them later.
     if not install_local_dependencies(): sys.exit(1)
-    
     if not create_env_file(): sys.exit(1)
     if not start_docker_service(): sys.exit(1)
 
