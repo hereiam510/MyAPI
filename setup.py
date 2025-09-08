@@ -32,7 +32,6 @@ def is_env_file_configured(filepath=".env"):
     if not os.path.exists(filepath):
         return False
         
-    # These are the specific placeholder values we want to ignore.
     placeholders = {
         "yourhkuid@connect.hku.hk",
         "your_password",
@@ -43,7 +42,6 @@ def is_env_file_configured(filepath=".env"):
         "your_16_character_gmail_app_password",
     }
     
-    # These are the only keys we care about to determine if the file is configured.
     keys_to_check = [
         "HKU_EMAIL", "HKU_PASSWORD", "ADMIN_API_KEY", 
         "ALERT_EMAIL_TO", "ALERT_EMAIL_FROM", "ALERT_EMAIL_PASSWORD"
@@ -60,15 +58,12 @@ def is_env_file_configured(filepath=".env"):
                     key, value = line.split('=', 1)
                     env_vars[key.strip()] = value.strip().strip('"').strip("'")
     except IOError:
-        return False # Cannot read the file, so treat as not configured.
+        return False
 
-    # Check if any of the critical keys have been filled with non-placeholder values.
     for key in keys_to_check:
         if key in env_vars and env_vars[key] and env_vars[key] not in placeholders:
-            # A key has a real value that isn't a placeholder.
             return True
             
-    # If we get here, no user-configurable keys have been changed.
     return False
 
 def create_env_file():
@@ -83,36 +78,43 @@ def create_env_file():
 
     env_content = []
     
-    # HKU Credentials
     print("\nPlease enter your HKU Portal credentials (for auto-token renewal).")
     hku_email = input("Enter your HKU email (e.g., yourhkuid@connect.hku.hk): ")
     hku_password = getpass.getpass("Enter your HKU password (will be hidden): ")
     env_content.append(f'HKU_EMAIL="{hku_email}"')
     env_content.append(f'HKU_PASSWORD="{hku_password}"')
 
-    # Admin API Key
     print("\nPlease set an Admin API Key to secure the proxy's admin endpoints.")
     admin_key = input("Enter your desired Admin API Key (leave blank to generate a random one): ")
     if not admin_key:
         admin_key = secrets.token_hex(32)
-        print(f"🔑 Generated secure Admin API Key: {admin_key}")
+        print("\n==================================================================")
+        print("    ✅ Your new, randomly generated Admin API Key is:")
+        print(f"    {admin_key}")
+        print("\n    ** IMPORTANT: Please copy this key and save it in a secure **")
+        print("    ** location (like a password manager). You will need it to **")
+        print("    ** use the manual MFA refresh script.                       **")
+        print("==================================================================")
+        input("Press Enter to continue after you have saved the key...")
+
     env_content.append(f'ADMIN_API_KEY="{admin_key}"')
 
-    # Default settings
     env_content.append("\n# --- Auto-Renewal & Alert Settings ---")
     env_content.append("TOKEN_REFRESH_INTERVAL_MINUTES=60")
     env_content.append("EMAIL_ALERT_FAILURES=3")
     env_content.append('PROXY_HOST="http://localhost:8000"')
-
-    # Email Alerts
-    setup_email = input("\nDo you want to set up email alerts for MFA notifications? (y/n): ").lower()
+    
+    setup_email = input("\nDo you want to set up email alerts for Multi-Factor Authentication (MFA) notifications? (y/n): ").lower()
     if setup_email == 'y':
         print("\nPlease provide your Gmail details for sending alerts.")
         print("NOTE: You must use a 16-character 'App Password' from Google, not your regular password.")
         print("See: https://support.google.com/accounts/answer/185833")
-        alert_to = input("Email address to send alerts TO: ")
-        alert_from = input("Your Gmail address to send alerts FROM: ")
-        alert_password = getpass.getpass("Your Gmail App Password (will be hidden): ")
+        
+        # --- MODIFIED LINES ---
+        # Clarified the purpose of each email address prompt.
+        alert_to = input("Enter the email address where you want to RECEIVE alerts: ")
+        alert_from = input("Enter the Gmail account the proxy will use to SEND alerts from: ")
+        alert_password = getpass.getpass("Your Gmail App Password for the sending account (will be hidden): ")
         
         env_content.append("\n# --- EMAIL ALERT SETTINGS (for Gmail App Password) ---")
         env_content.append(f'ALERT_EMAIL_TO="{alert_to}"')
