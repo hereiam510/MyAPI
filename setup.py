@@ -24,15 +24,38 @@ def check_prerequisites():
     print("✅ Docker and Docker Compose are installed.")
     return True
 
+def is_env_file_configured(filepath=".env"):
+    """
+    Checks if a .env file exists and contains user-modified data,
+    not just the default template values.
+    """
+    if not os.path.exists(filepath):
+        return False
+        
+    default_values = {
+        "yourhkuid@connect.hku.hk",
+        "your_password",
+        "your-own-super-long-and-secret-admin-key"
+    }
+    
+    with open(filepath, 'r') as f:
+        for line in f:
+            if '=' in line:
+                value = line.split('=', 1)[1].strip().strip('"').strip("'")
+                if value and value not in default_values:
+                    # Found a value that is not empty and not a default placeholder
+                    return True
+    return False
+
 def create_env_file():
     """Interactively gathers user input and creates the .env file."""
     print("\n--- Configuring .env File ---")
     
-    if os.path.exists(".env"):
-        overwrite = input("⚠️ A .env file already exists. Do you want to overwrite it? (y/n): ").lower()
+    if is_env_file_configured(".env"):
+        overwrite = input("⚠️ A configured .env file already exists. Do you want to overwrite it with new settings? (y/n): ").lower()
         if overwrite != 'y':
-            print("Exiting setup without changes.")
-            return False
+            print("Skipping .env configuration.")
+            return True # Allow setup to continue without changing .env
 
     env_content = []
     
