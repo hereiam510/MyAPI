@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 async def fetch_hku_token(email, password, headless=True):
     """
     Launches a Playwright browser to log into the HKU service and capture the auth token.
-    This version handles the multi-step redirect login flow with explicit waits.
+    This version handles the multi-step redirect login flow and iframes.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -31,33 +31,29 @@ async def fetch_hku_token(email, password, headless=True):
 
         if headless:
             try:
-                # Step 1: Click the initial "Sign In" button on the terms page
-                logger.info("Clicking the initial 'Sign In' button.")
+                # Step 1: Click the initial "Sign In" button and wait for navigation
+                logger.info("Clicking the initial 'Sign In' button and waiting for redirect.")
                 await page.click('button:has-text("Sign In")', timeout=10000)
-
-                # --- ADDED WAIT ---
-                # Wait for the redirect to the Microsoft login page to complete
-                logger.info("Waiting for redirect to Microsoft login page...")
                 await page.wait_for_load_state('networkidle', timeout=30000)
                 
-                # Step 2: Enter email in the Microsoft login form
-                logger.info("Entering email address.")
+                # --- MODIFIED SECTION ---
+                # The login form is inside an iframe, so we target it directly.
+                logger.info("Locating login iframe.")
+                login_frame = page.frame_locator('iframe').first
+
+                # Step 2: Enter email in the Microsoft login form (inside the iframe)
+                logger.info("Entering email address inside iframe.")
                 email_selector = 'input[type="email"]'
-                await page.wait_for_selector(email_selector, timeout=30000)
-                await page.fill(email_selector, email)
-                await page.click('input[type="submit"]')
+                await login_frame.locator(email_selector).wait_for(timeout=30000)
+                await login_frame.locator(email_selector).fill(email)
+                await login_frame.locator('input[type="submit"]').click()
 
-                # --- ADDED WAIT ---
-                # Wait for the redirect to the HKU password page to complete
-                logger.info("Waiting for redirect to HKU password page...")
-                await page.wait_for_load_state('networkidle', timeout=30000)
-
-                # Step 3: Enter password/PIN on the HKU login page
-                logger.info("Entering password (PIN).")
+                # Step 3: Enter password/PIN on the HKU login page (inside the iframe)
+                logger.info("Waiting for password page and entering password (PIN).")
                 password_selector = 'input[type="password"]'
-                await page.wait_for_selector(password_selector, timeout=30000)
-                await page.fill(password_selector, password)
-                await page.click('input[type="submit"], button:has-text("Sign in"), button:has-text("登入")')
+                await login_frame.locator(password_selector).wait_for(timeout=30000)
+                await login_frame.locator(password_selector).fill(password)
+                await login_frame.locator('input[type="submit"], button:has-text("Sign in"), button:has-text("登入")').click()
 
                 # Step 4: Wait for the final redirect back to the chat interface
                 logger.info("Login submitted, waiting for main chat page to load.")
@@ -66,9 +62,9 @@ async def fetch_hku_token(email, password, headless=True):
 
                 # Step 5: Trigger a request to capture the token
                 logger.info("Page loaded, sending a message to capture token.")
-                # It's possible the chat textarea is inside an iframe after login
                 chat_frame = page.frame_locator('iframe').first
                 textarea = chat_frame.locator('textarea')
+                await textarea.wait_for(timeout=15000)
                 await textarea.fill('Hello')
                 await textarea.press('Enter')
                 await asyncio.sleep(4)
