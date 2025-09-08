@@ -3,6 +3,7 @@ import asyncio
 import json
 import httpx
 import time
+import logging
 from fastapi import FastAPI, Request, HTTPException, Security
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader
@@ -13,8 +14,13 @@ from typing import Dict, Any, AsyncGenerator
 import smtplib
 from email.mime.text import MIMEText
 
-# Import the shared token fetching function
+# Import the shared token fetching function and new logger setup
 from token_fetcher import fetch_hku_token
+from logger_config import setup_logging
+
+# --- Setup Logging ---
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # =================================================
 #           CONFIGURATION SECTION
@@ -50,8 +56,8 @@ STANDARD_MODELS = {"gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-chat", "Dee
 # =================================================
 def send_mfa_alert(reason="MFA intervention required."):
     if not (ALERT_EMAIL_TO and ALERT_EMAIL_FROM and ALERT_EMAIL_PASSWORD):
-        print("[TokenRefresh] Email alerts not configured. A background refresh has failed and is now stopped.")
-        print("[TokenRefresh] Please run `python manual_mfa_refresh.py` to fix.")
+        logger.warning("Email alerts not configured. A background refresh has failed and is now stopped.")
+        logger.warning("Please run `python manual_mfa_refresh.py` to fix.")
         return False
     
     subject = "[HKU ChatGPT Proxy] ACTION REQUIRED: MFA Token Refresh"
@@ -73,10 +79,10 @@ def send_mfa_alert(reason="MFA intervention required."):
         server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD)
         server.sendmail(ALERT_EMAIL_FROM, ALERT_EMAIL_TO, msg.as_string())
         server.quit()
-        print(f"[ALERT] Email sent to {ALERT_EMAIL_TO}! Auto-refresh is now paused.")
+        logger.info(f"Email alert sent to {ALERT_EMAIL_TO}! Auto-refresh is now paused.")
         return True
     except Exception as e:
-        print(f"[ALERT] Failed to send alert email: {e}")
+        logger.error(f"Failed to send alert email: {e}", exc_info=True)
         return False
 
 # =================================================
@@ -89,36 +95,36 @@ async def refresh_token_background_loop(app_state):
     
     while True:
         if app_state["is_paused"].is_set():
-            print("[TokenRefresh] Paused. Waiting for manual token update...")
+            logger.warning("TokenRefresh is paused. Waiting for manual token update...")
             await app_state["is_paused"].wait()
-            print("[TokenRefresh] Resuming automatic refresh.")
+            logger.info("TokenRefresh is resuming automatic refresh.")
             failure_count = 0
 
         try:
-            print(f"[TokenRefresh] Attempting to auto-refresh HKU token.")
+            logger.info("Attempting to auto-refresh HKU token.")
             # Use the shared function in headless mode
             token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD, headless=True)
             
             if token:
                 app_state["hku_auth_token"] = token
-                print("[TokenRefresh] Token updated successfully.")
+                logger.info("Token updated successfully via background refresh.")
                 failure_count = 0
                 await asyncio.sleep(TOKEN_REFRESH_INTERVAL_MINUTES * 60)
             else:
-                print(f"[TokenRefresh] Failed to get new token (Attempt #{failure_count + 1}).")
+                logger.warning(f"Failed to get new token (Attempt #{failure_count + 1}).")
                 failure_count += 1
                 
                 if failure_count <= len(failure_intervals):
                     wait_time = failure_intervals[failure_count - 1] * 60
-                    print(f"[TokenRefresh] Retrying in {wait_time / 60} minute(s).")
+                    logger.info(f"Retrying token refresh in {wait_time / 60} minute(s).")
                     await asyncio.sleep(wait_time)
                 else:
-                    print("[TokenRefresh] All retry attempts failed. This may be an MFA issue.")
+                    logger.error("All retry attempts failed. This may be an MFA issue.")
                     send_mfa_alert("All automated refresh attempts failed.")
                     app_state["is_paused"].set()
 
         except Exception as e:
-            print(f"[TokenRefresh] An unexpected error occurred: {e}")
+            logger.error(f"An unexpected error occurred during token refresh: {e}", exc_info=True)
             await asyncio.sleep(60)
 
 # =================================================
@@ -126,11 +132,11 @@ async def refresh_token_background_loop(app_state):
 # =================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting up...")
+    logger.info("Application starting up...")
     app_state["background_task"] = asyncio.create_task(refresh_token_background_loop(app_state))
-    print("HKU token refresh background task started.")
+    logger.info("HKU token refresh background task started.")
     yield
-    print("Shutting down...")
+    logger.info("Application shutting down...")
     app_state["background_task"].cancel()
 
 app = FastAPI(title="HKU ChatGPT Proxy", version="8.0.0", lifespan=lifespan)
@@ -143,7 +149,8 @@ def get_api_key(api_key: str = Security(API_KEY_HEADER)):
 async def stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
     try:
         async for chunk in response.aiter_bytes(): yield chunk
-    except httpx.ReadError: print("Stream ended.")
+    except httpx.ReadError: 
+        logger.warning("Stream ended unexpectedly by client.")
     finally: await response.aclose()
 
 # =================================================
@@ -183,7 +190,7 @@ async def proxy_chat_completions(request: Request):
             req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
             resp = await client.send(req, stream=True)
             if resp.status_code == 401:
-                print("[Proxy] Received 401 Unauthorized. Manual refresh may be needed.")
+                logger.error("Received 401 Unauthorized from upstream. Token is likely expired. Manual refresh may be needed.")
                 raise HTTPException(status_code=401, detail="The HKU Auth Token is invalid or expired. Please use the manual refresh script if the problem persists.")
             
             resp.raise_for_status()
@@ -210,6 +217,7 @@ async def proxy_chat_completions(request: Request):
                 })
         except httpx.HTTPStatusError as e:
             error_body = await e.response.aread()
+            logger.error(f"Upstream API error: {e.response.status_code} - {error_body.decode()}")
             raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
 
 # =================================================
@@ -229,4 +237,5 @@ async def update_token(request: Request, api_key: str = Security(get_api_key)):
     if app_state["is_paused"].is_set():
         app_state["is_paused"].clear()
     
+    logger.info("Token was updated manually via the /update-token endpoint.")
     return {"message": "Token updated successfully and auto-refresh has been resumed."}

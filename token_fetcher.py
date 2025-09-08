@@ -1,5 +1,8 @@
 import asyncio
+import logging
 from playwright.async_api import async_playwright
+
+logger = logging.getLogger(__name__)
 
 async def fetch_hku_token(email, password, headless=True):
     """
@@ -53,7 +56,7 @@ async def fetch_hku_token(email, password, headless=True):
                 await asyncio.sleep(4)
 
             except Exception as e:
-                print(f"[TokenFetcher] Automated login failed: {e}")
+                logger.error(f"Automated login failed: {e}", exc_info=True)
                 await browser.close()
                 return None
         
@@ -61,9 +64,9 @@ async def fetch_hku_token(email, password, headless=True):
         try:
             # Set a timeout for the user to complete the login
             await asyncio.wait_for(token_captured.wait(), timeout=180) 
-            print("✅ HKU Auth Token captured successfully!")
+            logger.info("HKU Auth Token captured successfully!")
         except asyncio.TimeoutError:
-            print("❌ Timeout: No token was captured. Did you fully log in and send a message?")
+            logger.error("Timeout: No token was captured. Did you fully log in and send a message?")
         
         await browser.close()
         return token
