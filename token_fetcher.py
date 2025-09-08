@@ -37,9 +37,8 @@ async def fetch_hku_token(email, password, headless=True):
 
                 # Step 2: Wait for the Microsoft login pop-up page to appear
                 logger.info("Waiting for login pop-up...")
-                # The login form appears in a new tab/page (a pop-up)
-                # We wait for the pop-up and then assign it to a new variable.
-                popup_page = await context.wait_for_page(timeout=15000)
+                # --- THIS LINE IS NOW FIXED ---
+                popup_page = await context.wait_for_event('page', timeout=15000)
                 await popup_page.wait_for_load_state()
                 logger.info("Microsoft login pop-up detected.")
 
