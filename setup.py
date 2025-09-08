@@ -115,14 +115,23 @@ def send_test_email(to_email, from_email, password, server, port):
         return False
 
 def is_env_file_configured(filepath=".env"):
+    """
+    Checks if a .env file exists and contains actual user-entered credentials,
+    not just the default template placeholders.
+    """
     if not os.path.exists(filepath):
         return False
         
+    # --- FIXED SECTION ---
+    # This set now exactly matches the placeholders in the default .env file
     placeholders = {
-        "yourhkuid@connect.hku.hk", "your_password",
-        "your-own-super-long-and-secret-admin-key", "paste_your_long_bearer_token_here",
-        "your_alert_target@example.com", "your_gmail_account@gmail.com",
+        "yourhkuid@connect.hku.hk",
+        "your_hku_portal_password", # Corrected value
+        "your-own-super-long-and-secret-admin-key",
+        "your_alert_target@example.com",
+        "your_gmail_account@gmail.com",
         "your_16_character_gmail_app_password",
+        "", # Also check for empty strings
     }
     
     keys_to_check = [
@@ -141,9 +150,10 @@ def is_env_file_configured(filepath=".env"):
     except IOError:
         return False
 
+    # Check if any of the key credential values have been changed from the placeholder
     for key in keys_to_check:
-        if key in env_vars and env_vars[key] and env_vars[key] not in placeholders:
-            return True
+        if key in env_vars and env_vars[key] not in placeholders:
+            return True # Found a configured value
             
     return False
 
