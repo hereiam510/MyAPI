@@ -1,20 +1,28 @@
+import os
 import asyncio
 import logging
 from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
+# Define the path for the persistent browser session
+USER_DATA_DIR = "./playwright_user_data"
+
 async def fetch_hku_token(email, password, headless=True):
     """
-    Launches a Playwright browser to log into the HKU service and capture the auth token.
-    This version handles the multi-step redirect login flow and iframes.
+    Launches a Playwright browser with a persistent context to log in and capture the auth token.
+    This approach mimics a real user, saving cookies and session data to avoid detection.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context()
-        page = await context.new_page()
+        # Launch a persistent browser context
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
+            headless=headless,
+            slow_mo=50, # Adds a small delay to mimic human interaction
+        )
+        page = context.pages[0] if context.pages else await context.new_page()
 
-        await page.goto("https://chatgpt.hku.hk/")
+        await page.goto("https://chatgpt.hku.hk/", wait_until="networkidle")
 
         token = None
         token_captured = asyncio.Event()
@@ -29,54 +37,46 @@ async def fetch_hku_token(email, password, headless=True):
         
         page.on("request", intercept_request)
 
-        if headless:
-            try:
-                # Step 1: Click the initial "Sign In" button and wait for navigation
-                logger.info("Clicking the initial 'Sign In' button and waiting for redirect.")
-                await page.click('button:has-text("Sign In")', timeout=10000)
+        try:
+            # Check if we are already logged in by looking for the textarea
+            is_logged_in = await page.locator('textarea').is_visible()
+            if not is_logged_in:
+                logger.info("Not logged in. Starting the full login process.")
+                
+                # Step 1: Click the initial "Sign In" button
+                await page.click('button:has-text("Sign In")', timeout=20000)
                 await page.wait_for_load_state('networkidle', timeout=30000)
                 
-                # --- FINAL MODIFIED SECTION ---
-                # Target elements by their placeholder text, which is more reliable.
-                logger.info("Locating login iframe.")
+                # Step 2: Handle the iframe login
                 login_frame = page.frame_locator('iframe').first
+                
+                # Fill email
+                await login_frame.locator('input[type="email"]').fill(email)
+                await login_frame.locator('input[type="submit"]').click()
+                
+                # Fill password
+                await login_frame.locator('input[type="password"]').wait_for(timeout=30000)
+                await login_frame.locator('input[type="password"]').fill(password)
+                await login_frame.locator('input[type="submit"], button:has-text("Sign in")').click()
+                
+                logger.info("Login submitted. Waiting for final redirect.")
+                await page.wait_for_load_state('networkidle', timeout=60000)
+            else:
+                logger.info("Session is already active. Skipping login steps.")
 
-                # Step 2: Enter email using the placeholder text
-                logger.info("Entering email address inside iframe.")
-                # The placeholder text is "Email or phone" in Chinese
-                await login_frame.get_by_placeholder("電子郵件或電話").fill(email)
-                await login_frame.get_by_role("button", name="下一步").click()
+            # Step 3: Trigger a request to capture the token
+            logger.info("Sending a message to capture token.")
+            await page.locator('textarea').fill('Hello')
+            await page.locator('textarea').press('Enter')
+            
+            await asyncio.wait_for(token_captured.wait(), timeout=30)
+            logger.info("✅ HKU Auth Token captured successfully!")
 
-                # Step 3: Enter password/PIN using its placeholder
-                logger.info("Waiting for password page and entering password (PIN).")
-                await login_frame.get_by_placeholder("PIN").fill(password)
-                await login_frame.get_by_role("button", name="登入").click()
-
-                # Step 4: Wait for the final redirect back to the chat interface
-                logger.info("Login submitted, waiting for main chat page to load.")
-                await page.wait_for_load_state('networkidle', timeout=45000)
-                await asyncio.sleep(4)
-
-                # Step 5: Trigger a request to capture the token
-                logger.info("Page loaded, sending a message to capture token.")
-                chat_frame = page.frame_locator('iframe').first
-                textarea = chat_frame.locator('textarea')
-                await textarea.wait_for(timeout=15000)
-                await textarea.fill('Hello')
-                await textarea.press('Enter')
-                await asyncio.sleep(4)
-
-            except Exception as e:
-                await page.screenshot(path="debug_screenshot.png")
-                logger.error(f"Automated login failed. Screenshot saved. Error: {e}", exc_info=True)
-                await browser.close()
-                return None
-        
-        try:
-            await asyncio.wait_for(token_captured.wait(), timeout=180) 
-            logger.info("HKU Auth Token captured successfully!")
-        except asyncio.TimeoutError:
-            logger.error("Timeout: No token was captured. Did you fully log in and send a message?")
-        
-        await browser.close()
+        except Exception as e:
+            await page.screenshot(path="debug_screenshot.png")
+            logger.error(f"Automated login failed. Screenshot saved. Error: {e}", exc_info=True)
+            return None
+        finally:
+            await context.close()
+            
         return token
