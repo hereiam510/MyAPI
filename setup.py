@@ -85,11 +85,11 @@ def create_env_file():
     env_content.append(f'HKU_PASSWORD="{hku_password}"')
 
     # --- MODIFIED SECTION ---
-    # Added a forewarning about the importance of the Admin API Key.
+    # Consolidated and clarified the instructions for the Admin API Key.
     print("\nNext, you will set an Admin API Key.")
-    print("This key is required to use the manual MFA refresh script.")
-    print("You can provide your own, or leave the next prompt blank to generate a secure random one.")
-    admin_key = input("Enter your desired Admin API Key (leave blank to generate a random one): ")
+    print("This key is required for the manual MFA refresh script, so you MUST save it.")
+    print("You can either provide your own key or leave the prompt blank to generate a secure random one.")
+    admin_key = input("Enter your desired Admin API Key (or leave blank to generate): ")
     
     if not admin_key:
         admin_key = secrets.token_hex(32)
@@ -97,8 +97,7 @@ def create_env_file():
         print("    ✅ Your new, randomly generated Admin API Key is:")
         print(f"    {admin_key}")
         print("\n    ** IMPORTANT: Please copy this key and save it in a secure **")
-        print("    ** location (like a password manager). You will need it to **")
-        print("    ** use the manual MFA refresh script.                       **")
+        print("    ** location. You will need it for the MFA refresh script.   **")
         print("==================================================================")
         input("Press Enter to continue after you have saved the key...")
 
