@@ -23,11 +23,6 @@ async def fetch_hku_token(email, password, headless=True):
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
-        # --- FINAL FIX Part 1: Add an init script to evade bot detection ---
-        # This makes the browser look less like an automated script.
-        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        # ---
-
         await page.goto("https://chatgpt.hku.hk/", wait_until="networkidle")
 
         token = None
@@ -63,10 +58,6 @@ async def fetch_hku_token(email, password, headless=True):
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     
                     login_page = await popup_info.value
-                    
-                    # Also apply the bot evasion script to the popup
-                    await login_page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                    
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
                     logger.info("Pop-up window detected. Proceeding with Microsoft login.")
 
@@ -78,15 +69,20 @@ async def fetch_hku_token(email, password, headless=True):
                     await login_page.locator("#submitButton").click()
                     logger.info("Password submitted.")
 
+                    # --- FINAL FIX: Handle the "Stay signed in?" prompt ---
                     logger.info("Handling 'Stay signed in?' prompt if it appears...")
                     try:
+                        # This locator looks for the "Yes" button by its test ID or value in English/Chinese.
                         stay_signed_in_button = login_page.locator(
                             '[data-testid="KmsiYes"], input[type="submit"][value="Yes"], input[type="submit"][value="是"]'
                         )
+                        # Click the button if it appears, otherwise continue after a short timeout.
                         await stay_signed_in_button.click(timeout=10000)
                         logger.info("Handled 'Stay signed in?' prompt.")
                     except PlaywrightTimeoutError:
+                        # This is not an error; it just means the prompt didn't appear this time.
                         logger.info("'Stay signed in?' prompt did not appear, continuing.")
+                    # --- END FINAL FIX ---
 
                     logger.info("Checking for MFA by monitoring network traffic...")
                     mfa_detected = asyncio.Event()
@@ -97,8 +93,11 @@ async def fetch_hku_token(email, password, headless=True):
                     login_page.on("request", intercept_mfa_poll)
 
                     try:
-                        await asyncio.wait_for(mfa_detected.wait(), timeout=5)
-                        logger.error("MFA PROMPT DETECTED.")
+                        await asyncio.wait_for(mfa_detected.wait(), timeout=5) # Shortened timeout
+                        logger.error("="*70)
+                        logger.error("MFA PROMPT DETECTED. Automated login cannot proceed.")
+                        logger.error("Please run `python manual_mfa_refresh.py` to log in manually.")
+                        logger.error("="*70)
                         raise Exception("MFA validation is required, aborting auto-refresh.")
 
                     except asyncio.TimeoutError:
@@ -106,12 +105,12 @@ async def fetch_hku_token(email, password, headless=True):
                     
                     login_page.remove_listener("request", intercept_mfa_poll)
                     
-                    # --- FINAL FIX Part 2: Wait directly for the target element ---
-                    logger.info("Login process complete. Waiting for chat interface to render...")
-                    # This is more reliable than waiting for the network. We wait for the element itself.
-                    await chat_interface_locator.wait_for(state="visible", timeout=90000)
+                    logger.info("Waiting for the main chat page to finish loading...")
+                    await page.wait_for_load_state("networkidle", timeout=90000)
+                    logger.info("Main page has loaded. Chat interface should now be visible.")
+
+                    await chat_interface_locator.wait_for(state="visible", timeout=10000)
                     logger.info("Chat interface is ready.")
-                    # ---
 
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
