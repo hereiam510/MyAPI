@@ -23,6 +23,11 @@ async def fetch_hku_token(email, password, headless=True):
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
+        # --- FINAL FIX Part 1: Add an init script to evade bot detection ---
+        # This makes the browser look less like an automated script.
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # ---
+
         await page.goto("https://chatgpt.hku.hk/", wait_until="networkidle")
 
         token = None
@@ -40,8 +45,9 @@ async def fetch_hku_token(email, password, headless=True):
 
         try:
             if headless:
+                chat_interface_locator = page.locator("#chat-textarea")
+                
                 logger.info("Checking for an existing valid session...")
-                chat_interface_locator = page.locator('textarea[placeholder^="Join your query"]')
                 is_logged_in = False
                 try:
                     await chat_interface_locator.wait_for(state="visible", timeout=30000)
@@ -57,6 +63,10 @@ async def fetch_hku_token(email, password, headless=True):
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     
                     login_page = await popup_info.value
+                    
+                    # Also apply the bot evasion script to the popup
+                    await login_page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                    
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
                     logger.info("Pop-up window detected. Proceeding with Microsoft login.")
 
@@ -66,46 +76,48 @@ async def fetch_hku_token(email, password, headless=True):
 
                     await login_page.locator("#passwordInput").fill(password)
                     await login_page.locator("#submitButton").click()
-                    logger.info("Password submitted. Checking for MFA by monitoring network traffic...")
+                    logger.info("Password submitted.")
 
-                    # --- FINAL FIX: Network-Based MFA Detection (Language-Independent) ---
-                    # This method detects the specific API call the MFA page makes to poll for approval.
+                    logger.info("Handling 'Stay signed in?' prompt if it appears...")
+                    try:
+                        stay_signed_in_button = login_page.locator(
+                            '[data-testid="KmsiYes"], input[type="submit"][value="Yes"], input[type="submit"][value="是"]'
+                        )
+                        await stay_signed_in_button.click(timeout=10000)
+                        logger.info("Handled 'Stay signed in?' prompt.")
+                    except PlaywrightTimeoutError:
+                        logger.info("'Stay signed in?' prompt did not appear, continuing.")
+
+                    logger.info("Checking for MFA by monitoring network traffic...")
                     mfa_detected = asyncio.Event()
-
                     async def intercept_mfa_poll(request):
                         if "/SAS/EndAuth" in request.url and "authMethodId" in request.url:
-                            logger.info(f"MFA polling request detected: {request.url}")
                             mfa_detected.set()
 
                     login_page.on("request", intercept_mfa_poll)
 
                     try:
-                        # Wait for a short period to see if the MFA polling starts.
-                        # If this times out, it means the MFA page did NOT load. This is the success path.
-                        await asyncio.wait_for(mfa_detected.wait(), timeout=10)
-                        
-                        # If the event was set, we detected MFA. This is the failure path.
-                        logger.error("="*70)
-                        logger.error("MFA PROMPT DETECTED via network interception. Automated login cannot proceed.")
-                        logger.error("Please run `python manual_mfa_refresh.py` to log in manually.")
-                        logger.error("="*70)
+                        await asyncio.wait_for(mfa_detected.wait(), timeout=5)
+                        logger.error("MFA PROMPT DETECTED.")
                         raise Exception("MFA validation is required, aborting auto-refresh.")
 
                     except asyncio.TimeoutError:
-                        # SUCCESS: The timeout means no MFA polling was detected.
                         logger.info("No MFA polling detected. Assuming successful login.")
                     
                     login_page.remove_listener("request", intercept_mfa_poll)
-                    await page.wait_for_url("https://chatgpt.hku.hk/**", timeout=90000)
+                    
+                    # --- FINAL FIX Part 2: Wait directly for the target element ---
+                    logger.info("Login process complete. Waiting for chat interface to render...")
+                    # This is more reliable than waiting for the network. We wait for the element itself.
                     await chat_interface_locator.wait_for(state="visible", timeout=90000)
-                    logger.info("Login complete and chat interface is ready.")
-                    # --- END FINAL FIX ---
+                    logger.info("Chat interface is ready.")
+                    # ---
 
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
 
-                chat_input = page.locator('textarea[placeholder^="Join your query"]')
-                send_button = page.locator('button:has-text("Send a message")')
+                chat_input = chat_interface_locator
+                send_button = page.locator('[data-testid="send-button"]')
 
                 logger.info("Sending a message to capture token.")
                 await chat_input.fill('Hello')
