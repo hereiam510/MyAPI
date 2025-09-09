@@ -41,10 +41,10 @@ async def fetch_hku_token(email, password, headless=True):
         try:
             if headless:
                 logger.info("Checking for an existing valid session...")
-                chat_interface_locator = page.locator('div:has-text("Start chatting")')
+                chat_interface_locator = page.locator('textarea[placeholder^="Join your query"]')
                 is_logged_in = False
                 try:
-                    await chat_interface_locator.wait_for(timeout=30000)
+                    await chat_interface_locator.wait_for(state="visible", timeout=30000)
                     is_logged_in = True
                 except PlaywrightTimeoutError:
                     is_logged_in = False
@@ -66,22 +66,39 @@ async def fetch_hku_token(email, password, headless=True):
 
                     await login_page.locator("#passwordInput").fill(password)
                     await login_page.locator("#submitButton").click()
-                    logger.info("Password submitted. Checking for MFA prompt...")
+                    logger.info("Password submitted. Checking for MFA by monitoring network traffic...")
 
-                    # --- FINAL FIX: Language-Independent MFA Detection ---
-                    # Look for a hidden input field that only exists on the MFA page.
-                    mfa_prompt_locator = login_page.locator('input[name="authMethodId"]')
+                    # --- FINAL FIX: Network-Based MFA Detection (Language-Independent) ---
+                    # This method detects the specific API call the MFA page makes to poll for approval.
+                    mfa_detected = asyncio.Event()
+
+                    async def intercept_mfa_poll(request):
+                        if "/SAS/EndAuth" in request.url and "authMethodId" in request.url:
+                            logger.info(f"MFA polling request detected: {request.url}")
+                            mfa_detected.set()
+
+                    login_page.on("request", intercept_mfa_poll)
+
                     try:
-                        await mfa_prompt_locator.wait_for(state="attached", timeout=10000)
+                        # Wait for a short period to see if the MFA polling starts.
+                        # If this times out, it means the MFA page did NOT load. This is the success path.
+                        await asyncio.wait_for(mfa_detected.wait(), timeout=10)
+                        
+                        # If the event was set, we detected MFA. This is the failure path.
                         logger.error("="*70)
-                        logger.error("MFA PROMPT DETECTED. Automated login cannot proceed.")
+                        logger.error("MFA PROMPT DETECTED via network interception. Automated login cannot proceed.")
                         logger.error("Please run `python manual_mfa_refresh.py` to log in manually.")
                         logger.error("="*70)
                         raise Exception("MFA validation is required, aborting auto-refresh.")
-                    except PlaywrightTimeoutError:
-                        logger.info("No MFA prompt detected. Waiting for chat interface to load...")
-                        await chat_interface_locator.wait_for(state="visible", timeout=90000)
-                        logger.info("Login complete and chat interface is ready.")
+
+                    except asyncio.TimeoutError:
+                        # SUCCESS: The timeout means no MFA polling was detected.
+                        logger.info("No MFA polling detected. Assuming successful login.")
+                    
+                    login_page.remove_listener("request", intercept_mfa_poll)
+                    await page.wait_for_url("https://chatgpt.hku.hk/**", timeout=90000)
+                    await chat_interface_locator.wait_for(state="visible", timeout=90000)
+                    logger.info("Login complete and chat interface is ready.")
                     # --- END FINAL FIX ---
 
                 else:
