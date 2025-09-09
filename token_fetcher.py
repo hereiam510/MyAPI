@@ -40,10 +40,17 @@ async def fetch_hku_token(email, password, headless=True):
 
         try:
             if headless:
-                is_logged_in = await page.locator('textarea').is_visible(timeout=10000)
-                
+                logger.info("Checking for an existing valid session...")
+                chat_interface_locator = page.locator('div:has-text("Start chatting")')
+                is_logged_in = False
+                try:
+                    await chat_interface_locator.wait_for(timeout=30000)
+                    is_logged_in = True
+                except PlaywrightTimeoutError:
+                    is_logged_in = False
+
                 if not is_logged_in:
-                    logger.info("Not logged in. Starting the full automated login process.")
+                    logger.warning("No active session found. Attempting a full login.")
                     
                     logger.info("Waiting for login pop-up window...")
                     async with page.expect_popup() as popup_info:
@@ -53,30 +60,39 @@ async def fetch_hku_token(email, password, headless=True):
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
                     logger.info("Pop-up window detected. Proceeding with Microsoft login.")
 
-                    # Microsoft email page
                     await login_page.locator('input[type="email"]').fill(email)
                     await login_page.locator('input[type="submit"]').click()
                     logger.info("Email submitted. Waiting for HKU password page.")
 
-                    # --- FINAL FIX ---
-                    # Use specific selectors for the HKU password page based on screenshots.
-                    # This is more robust than general selectors.
-                    # Wait for the password input with ID 'passwordInput' and fill it.
                     await login_page.locator("#passwordInput").fill(password)
-                    # Click the sign-in button with ID 'submitButton'.
                     await login_page.locator("#submitButton").click()
+                    logger.info("Password submitted. Checking for MFA prompt...")
+
+                    # --- FINAL FIX: Language-Independent MFA Detection ---
+                    # Look for a hidden input field that only exists on the MFA page.
+                    mfa_prompt_locator = login_page.locator('input[name="authMethodId"]')
+                    try:
+                        await mfa_prompt_locator.wait_for(state="attached", timeout=10000)
+                        logger.error("="*70)
+                        logger.error("MFA PROMPT DETECTED. Automated login cannot proceed.")
+                        logger.error("Please run `python manual_mfa_refresh.py` to log in manually.")
+                        logger.error("="*70)
+                        raise Exception("MFA validation is required, aborting auto-refresh.")
+                    except PlaywrightTimeoutError:
+                        logger.info("No MFA prompt detected. Waiting for chat interface to load...")
+                        await chat_interface_locator.wait_for(state="visible", timeout=90000)
+                        logger.info("Login complete and chat interface is ready.")
                     # --- END FINAL FIX ---
-                    
-                    logger.info("Password submitted. Waiting for login to complete.")
-                    await page.wait_for_load_state('networkidle', timeout=90000) # Increased timeout for safety
-                    logger.info("Login complete. Main page has loaded.")
 
                 else:
-                    logger.info("Session is already active. Skipping login steps.")
+                    logger.info("✅ Valid session found. Skipping login.")
+
+                chat_input = page.locator('textarea[placeholder^="Join your query"]')
+                send_button = page.locator('button:has-text("Send a message")')
 
                 logger.info("Sending a message to capture token.")
-                await page.locator('textarea').fill('Hello')
-                await page.locator('textarea').press('Enter')
+                await chat_input.fill('Hello')
+                await send_button.click()
 
             else:
                 logger.info("Browser is open. Please complete the login and MFA process manually.")
@@ -88,7 +104,10 @@ async def fetch_hku_token(email, password, headless=True):
         except Exception as e:
             if headless:
                 await page.screenshot(path="debug_screenshot.png")
-            logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
+            if "MFA validation is required" in str(e):
+                 logger.error(f"Token acquisition failed: {e}")
+            else:
+                 logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
             return None
         finally:
             await context.close()
