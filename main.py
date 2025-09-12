@@ -14,8 +14,8 @@ from contextlib import asynccontextmanager
 import smtplib
 from email.mime.text import MIMEText
 
-# Import the shared token fetching function, new logger, and custom exception
-from token_fetcher import fetch_hku_token, MfaTimeoutError
+# Import the shared token fetching function, logger, and custom exceptions
+from token_fetcher import fetch_hku_token, MfaTimeoutError, MfaNotificationError
 from logger_config import setup_logging
 
 setup_logging()
@@ -113,10 +113,16 @@ async def refresh_token_background_loop(app_state):
             logger.error(f"MFA approval timed out: {e}")
             send_mfa_alert(f"MFA approval timed out. The user did not respond in time.")
             app_state["is_paused"].set()
+        
+        except MfaNotificationError as e:
+            logger.error(f"MFA notification failed: {e}")
+            send_mfa_alert(f"Could not send the MFA number alert email after multiple retries. The email system may be misconfigured.")
+            app_state["is_paused"].set() # Immediately pause without standard retries
         # --- END: New Smarter Failure Handling ---
+
         except Exception as e:
             logger.error(f"An unexpected error occurred during token refresh: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            await asyncio.sleep(60) # Wait a minute before retrying on unexpected errors
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
