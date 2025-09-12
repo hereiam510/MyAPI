@@ -67,8 +67,9 @@ async def send_mfa_number_alert_with_retries(number: str):
     msg['Subject'] = subject
     msg['From'] = from_email
     msg['To'] = to_email
-    
-    retry_delays = [90, 105] 
+
+    # --- NEW: Adjusted retry logic for final attempt at 3m 15s ---
+    retry_delays = [90, 105] # Delay for 2nd attempt (1m 30s), final attempt (1m 45s later)
     max_retries = 3
 
     for attempt in range(max_retries):
@@ -79,7 +80,7 @@ async def send_mfa_number_alert_with_retries(number: str):
             server.sendmail(from_email, to_email, msg.as_string())
             server.quit()
             logger.info(f"MFA number email sent to {to_email} (Attempt #{attempt + 1}). Waiting for approval...")
-            return True 
+            return True # Success
         except Exception as e:
             logger.error(f"Failed to send MFA number email (Attempt #{attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -106,33 +107,29 @@ def manage_trace_files():
 
 async def fetch_hku_token(email, password, headless=True):
     manage_trace_files()
-    login_page = None
-    context = None
     async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR, headless=headless, slow_mo=50 if headless else None
+        )
+        await context.tracing.start(screenshots=True, snapshots=True, sources=True)
+        page = context.pages[0] if context.pages else await context.new_page()
+        await page.goto("https://chatgpt.hku.hk/", wait_until="networkidle")
+
+        token = None
+        token_captured = asyncio.Event()
+
+        async def intercept_request(request):
+            nonlocal token
+            if "completions" in request.url and "authorization" in request.headers:
+                token = request.headers["authorization"].split(" ")[1]
+                token_captured.set()
+        
+        page.on("request", intercept_request)
+        
+        chat_input_locator = page.locator('textarea[placeholder*="Type your query here"]')
+        send_button_locator = page.locator('[data-testid="send-button"], button:has-text("Send")')
+
         try:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=USER_DATA_DIR, headless=headless, slow_mo=50 if headless else None
-            )
-            await context.tracing.start(screenshots=True, snapshots=True, sources=True)
-            page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto("https://chatgpt.hku.hk/", wait_until="networkidle")
-
-            token = None
-            token_captured = asyncio.Event()
-
-            async def intercept_request(request):
-                nonlocal token
-                if "completions" in request.url and "authorization" in request.headers:
-                    auth_header = request.headers.get("authorization", "")
-                    if " " in auth_header:
-                        token = auth_header.split(" ")[1]
-                        token_captured.set()
-            
-            page.on("request", intercept_request)
-            
-            chat_input_locator = page.locator('textarea[placeholder*="Type your query here"]')
-            send_button_locator = page.locator('[data-testid="send-button"], button:has-text("Send")')
-
             if headless:
                 is_logged_in = False
                 try:
@@ -147,83 +144,88 @@ async def fetch_hku_token(email, password, headless=True):
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     login_page = await popup_info.value
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
-                    
-                    account_picker_locator = login_page.locator(f'div[data-test-id="{email}"]')
-                    if await account_picker_locator.is_visible(timeout=10000):
-                        logger.info("Account picker screen detected. Selecting saved account.")
-                        await account_picker_locator.click()
 
+                    hku_pin_page_locator = login_page.locator("input[name='PIN']")
                     ms_email_page_locator = login_page.locator("input[type='email']")
-                    if await ms_email_page_locator.is_visible(timeout=5000):
-                        await ms_email_page_locator.fill(email)
-                        await login_page.locator('input[type="submit"]').click()
+                    
+                    try:
+                        hku_task = asyncio.create_task(hku_pin_page_locator.wait_for(state="visible", timeout=15000))
+                        ms_task = asyncio.create_task(ms_email_page_locator.wait_for(state="visible", timeout=15000))
+                        
+                        done, pending = await asyncio.wait([hku_task, ms_task], return_when=asyncio.FIRST_COMPLETED)
+                        for task in pending: task.cancel()
 
-                    await login_page.locator("input[name='PIN']").fill(password)
-                    await login_page.locator("input[type='submit']").click()
+                        if hku_task in done:
+                            await login_page.locator("input[type='email']").fill(email)
+                        elif ms_task in done:
+                            await ms_email_page_locator.fill(email)
+                            await login_page.locator('input[type="submit"]').click()
+                    except PlaywrightTimeoutError:
+                        logger.error("Could not find the email/username input field on the login page.")
+                        raise
+
+                    await login_page.locator("#passwordInput, input[name='PIN']").fill(password)
+                    await login_page.locator("#submitButton, input[type='submit']").click()
                     logger.info("Password submitted. Determining next step...")
 
+                    mfa_selection_locator = login_page.locator('div.tile[data-value="CompanionAppsNotification"]')
                     mfa_number_locator = login_page.locator("div.displaySign")
-                    await mfa_number_locator.wait_for(state="visible", timeout=60000)
-
-                    mfa_max_attempts = 3
-                    login_successful = False
-                    for attempt in range(mfa_max_attempts):
-                        if await mfa_number_locator.is_visible():
-                            mfa_number = await mfa_number_locator.inner_text()
-                            logger.warning(f"MFA PROMPT (Attempt #{attempt + 1}/{mfa_max_attempts}) DETECTED with number: {mfa_number}.")
-                            await send_mfa_number_alert_with_retries(mfa_number)
-                            
-                            logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
-                            
-                            # Define locators for all possible outcomes
-                            kmsi_locator = login_page.locator('text="Stay signed in?"')
-                            denied_locator = login_page.locator('text="Request denied"')
-                            error_alert_locator = login_page.locator('div[role="alert"]')
-
-                            # Race the outcomes
-                            kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
-                            success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
-                            denied_task = asyncio.create_task(denied_locator.wait_for(state="visible", timeout=285000))
-                            error_task = asyncio.create_task(error_alert_locator.wait_for(state="visible", timeout=285000))
-
-                            done, pending = await asyncio.wait([kmsi_task, success_task, denied_task, error_task], return_when=asyncio.FIRST_COMPLETED)
-                            for task in pending: task.cancel()
-
-                            if success_task in done:
-                                logger.info("MFA approved. Login successful.")
-                                login_successful = True
-                                break
-                            
-                            elif kmsi_task in done:
-                                logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
-                                await login_page.locator('input[type="submit"][value="Yes"]').click()
-                                await chat_input_locator.wait_for(state="visible", timeout=60000)
-                                logger.info("MFA flow complete. Login successful.")
-                                login_successful = True
-                                break
-
-                            elif denied_task in done:
-                                logger.error(f"MFA request was denied by the user (Attempt #{attempt + 1}).")
-                                if attempt < mfa_max_attempts - 1:
-                                    logger.warning("Requesting a new MFA prompt...")
-                                    await login_page.locator('a:has-text("Send another request")').click()
-                                    await mfa_number_locator.wait_for(state="visible", timeout=30000)
-                                    continue
-                                else:
-                                    raise MfaTimeoutError("MFA request denied multiple times. Aborting.")
-                            
-                            elif error_task in done:
-                                error_text = await error_alert_locator.inner_text()
-                                raise MfaTimeoutError(f"MFA failed. The portal displayed an error: '{error_text}'")
-                            
-                            else:
-                                # This case handles the timeout if none of the locators are found
-                                raise MfaTimeoutError("User did not approve MFA within the time limit.")
-                        else:
-                            break 
+                    kmsi_locator = login_page.locator('text="Stay signed in?"')
                     
-                    if not login_successful:
-                        raise MfaTimeoutError("Could not complete the MFA login flow after all attempts.")
+                    mfa_selection_task = asyncio.create_task(mfa_selection_locator.wait_for(state="visible", timeout=60000))
+                    mfa_number_task = asyncio.create_task(mfa_number_locator.wait_for(state="visible", timeout=60000))
+                    kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=60000))
+                    success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=60000))
+
+                    done, pending = await asyncio.wait(
+                        [mfa_selection_task, mfa_number_task, kmsi_task, success_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending: task.cancel()
+
+                    if mfa_selection_task in done:
+                        logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
+                        await mfa_selection_locator.click()
+                        logger.info("Waiting for the number matching screen...")
+                        await mfa_number_locator.wait_for(state="visible", timeout=60000)
+
+                    if mfa_number_locator.is_visible():
+                        mfa_number = await mfa_number_locator.inner_text()
+                        logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
+                        
+                        await send_mfa_number_alert_with_retries(mfa_number)
+                        
+                        try:
+                            logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
+                            post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
+                            post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
+                            
+                            done_after_mfa, pending_after_mfa = await asyncio.wait([post_mfa_kmsi_task, post_mfa_success_task], return_when=asyncio.FIRST_COMPLETED)
+                            for task in pending_after_mfa: task.cancel()
+
+                            if post_mfa_kmsi_task in done_after_mfa:
+                                logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
+                                await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
+                                await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                            
+                            await chat_input_locator.wait_for(state="visible", timeout=60000)
+                            logger.info("MFA flow complete. Login successful.")
+
+                        except PlaywrightTimeoutError:
+                            raise MfaTimeoutError("User did not approve MFA within the time limit.")
+
+                    elif kmsi_task in done:
+                        logger.info("'Stay signed in?' prompt detected. Checking box and clicking Yes.")
+                        await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
+                        await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                        await chat_input_locator.wait_for(state="visible", timeout=60000)
+                        logger.info("Login successful after handling prompt.")
+
+                    elif success_task in done:
+                        logger.info("Direct login successful.")
+                    
+                    else:
+                        raise Exception("Login flow stalled after password submission. No known next step detected.")
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
 
@@ -238,20 +240,18 @@ async def fetch_hku_token(email, password, headless=True):
 
         except Exception as e:
             logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
-            if headless and context:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                trace_path = os.path.join(TRACE_DIR, f"trace_error_{timestamp}.zip")
-                try:
-                    await context.tracing.stop(path=trace_path)
-                    logger.info(f"Debugging trace saved to '{trace_path}'.")
-                except Exception as trace_err:
-                    logger.error(f"Error saving trace file: {trace_err}", exc_info=True)
-            
+            if headless: await page.screenshot(path="debug_screenshot.png")
             if isinstance(e, (MfaTimeoutError, MfaNotificationError)):
                 raise e
             return None
         finally:
-            if context:
-                await context.close()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_path = os.path.join(TRACE_DIR, f"trace_{timestamp}.zip")
+            try:
+                await context.tracing.stop(path=trace_path)
+                logger.info(f"Debugging trace saved to '{trace_path}'.")
+            except Exception as e:
+                logger.error(f"Error saving trace file: {e}", exc_info=True)
+            await context.close()
             
         return token
