@@ -33,7 +33,7 @@ def run_command(command, error_message, capture_stdout=False):
 
 def check_prerequisites():
     """Checks if Docker and Docker Compose are installed."""
-    print("--- Checking Prerequisites ---") # Keep print for setup flow
+    print("--- Checking Prerequisites ---")
     success, _ = run_command("docker --version", "Docker is not installed or not in your PATH.")
     if not success: return False
     success, _ = run_command("docker-compose --version", "Docker Compose is not installed or not in your PATH.")
@@ -43,7 +43,7 @@ def check_prerequisites():
 
 def install_local_dependencies():
     """Installs local Python and Playwright dependencies, detecting `uv`."""
-    print("\n--- Installing Local Dependencies ---") # Keep print
+    print("\n--- Installing Local Dependencies ---")
     installer = "pip"
     if shutil.which("uv"):
         installer = "uv pip"
@@ -65,12 +65,63 @@ def install_local_dependencies():
     print("✅ Playwright browsers installed.")
     return True
 
+# --- NEW FUNCTION TO SET UP SHELL ALIAS ---
+def setup_shell_alias():
+    """Asks the user if they want to create a convenient shell alias for viewing traces."""
+    print("\n--- Optional: Create Shell Alias ---")
+    
+    # Define the alias command
+    alias_name = "pwt"
+    alias_command = f"alias {alias_name}='playwright show-trace $(ls -1t traces/*.zip | head -n 1)'"
+    
+    # Explain what it does
+    print(f"This script can add a shell alias '{alias_name}' to your profile.")
+    print("It allows you to view the most recent Playwright trace by simply typing 'pwt'.")
+    
+    create_alias = input("Do you want to add this alias to your shell configuration? (y/n): ").lower()
+    if create_alias != 'y':
+        print("Skipping alias creation.")
+        return
+
+    # Detect shell and config file
+    shell = os.environ.get("SHELL", "")
+    config_file = None
+    if "bash" in shell:
+        config_file = os.path.expanduser("~/.bashrc")
+    elif "zsh" in shell:
+        config_file = os.path.expanduser("~/.zshrc")
+    else:
+        print(f"⚠️ Could not determine your shell or it's not supported ({shell}). Please add the following alias manually:")
+        print(f"   {alias_command}")
+        return
+
+    # Check if the alias already exists
+    try:
+        if os.path.exists(config_file):
+            with open(config_file, "r") as f:
+                if alias_name in f.read():
+                    print(f"✅ The '{alias_name}' alias already seems to exist in {config_file}. No changes made.")
+                    return
+    except IOError as e:
+        logger.error(f"Error reading shell config file: {e}", exc_info=True)
+        print(f"❌ Could not read {config_file}. Please add the alias manually.")
+        return
+
+    # Add the alias to the file
+    try:
+        with open(config_file, "a") as f:
+            f.write("\n# Alias for HKU ChatGPT Proxy project to view latest trace\n")
+            f.write(f"{alias_command}\n")
+        print(f"\n✅ Alias '{alias_name}' has been added to {config_file}.")
+        print("Please run `source {config_file}` or restart your terminal to use it.")
+    except IOError as e:
+        logger.error(f"Error writing to shell config file: {e}", exc_info=True)
+        print(f"❌ Could not write to {config_file}. Please add the alias manually.")
+
 def perform_initial_login(email, password):
     """Wrapper to run the async token fetching logic."""
-    # THE IMPORT IS NOW HERE:
     from token_fetcher import fetch_hku_token
 
-    # Keep user-facing text as print() for interactivity
     print("\n--- Initial Token Acquisition ---")
     print("""
 ==============================================================================
@@ -84,7 +135,6 @@ def perform_initial_login(email, password):
 ==============================================================================
 """)
     input("Press Enter to open the browser and begin...")
-    # Use the shared function with the browser visible
     return asyncio.run(fetch_hku_token(email, password, headless=False))
 
 def send_test_email(to_email, from_email, password, server, port):
@@ -103,10 +153,10 @@ def send_test_email(to_email, from_email, password, server, port):
         smtp_server.login(from_email, password)
         smtp_server.sendmail(from_email, to_email, msg.as_string())
         smtp_server.quit()
-        print("✅ Test email sent successfully!") # Keep print for user feedback
+        print("✅ Test email sent successfully!")
         return True
     except smtplib.SMTPAuthenticationError:
-        print("❌ Failed to send test email. Error: Authentication failed.") # Keep print
+        print("❌ Failed to send test email. Error: Authentication failed.")
         print("   Please double-check your 'From' email and your 16-character App Password.")
         return False
     except Exception as e:
@@ -122,16 +172,14 @@ def is_env_file_configured(filepath=".env"):
     if not os.path.exists(filepath):
         return False
         
-    # --- FIXED SECTION ---
-    # This set now exactly matches the placeholders in the default .env file
     placeholders = {
         "yourhkuid@connect.hku.hk",
-        "your_hku_portal_password", # Corrected value
+        "your_hku_portal_password",
         "your-own-super-long-and-secret-admin-key",
         "your_alert_target@example.com",
         "your_gmail_account@gmail.com",
         "your_16_character_gmail_app_password",
-        "", # Also check for empty strings
+        "",
     }
     
     keys_to_check = [
@@ -150,16 +198,15 @@ def is_env_file_configured(filepath=".env"):
     except IOError:
         return False
 
-    # Check if any of the key credential values have been changed from the placeholder
     for key in keys_to_check:
         if key in env_vars and env_vars[key] not in placeholders:
-            return True # Found a configured value
+            return True
             
     return False
 
 def create_env_file():
     """Interactively gathers user input and creates the .env file."""
-    print("\n--- Configuring .env File ---") # Keep print
+    print("\n--- Configuring .env File ---")
     
     if is_env_file_configured(".env"):
         overwrite = input("⚠️ A configured .env file already exists. Do you want to overwrite it with new settings? (y/n): ").lower()
@@ -296,6 +343,10 @@ def main():
     
     if not check_prerequisites(): sys.exit(1)
     if not install_local_dependencies(): sys.exit(1)
+    
+    # --- ADDED ALIAS SETUP STEP ---
+    setup_shell_alias()
+
     if not create_env_file(): sys.exit(1)
     if not start_docker_service(): sys.exit(1)
 
