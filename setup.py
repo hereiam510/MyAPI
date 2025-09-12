@@ -343,12 +343,15 @@ def main():
     
     if not check_prerequisites(): sys.exit(1)
     if not install_local_dependencies(): sys.exit(1)
-    
-    # --- ADDED ALIAS SETUP STEP ---
-    setup_shell_alias()
-
     if not create_env_file(): sys.exit(1)
+    
+    # Run the service start first
     if not start_docker_service(): sys.exit(1)
+    
+    # --- MOVED ALIAS SETUP STEP TO THE END ---
+    # Offer the optional convenience alias after the main setup is successful.
+    setup_shell_alias()
 
 if __name__ == "__main__":
     main()
+
