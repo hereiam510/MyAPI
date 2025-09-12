@@ -9,48 +9,30 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 logger = logging.getLogger(__name__)
 
 USER_DATA_DIR = "./playwright_user_data"
-# --- MODIFIED: Use an absolute path for the trace directory for clarity ---
 TRACE_DIR = os.path.abspath("./traces")
-# --- END: Modification ---
 
 def manage_trace_files():
     """Keeps only the 5 most recent trace files and deletes the rest."""
     try:
-        # --- MODIFIED: More robust directory creation and logging ---
-        logger.info(f"Checking for trace directory: {TRACE_DIR}")
         if not os.path.exists(TRACE_DIR):
-            logger.warning(f"Trace directory does not exist. Attempting to create it at: {TRACE_DIR}")
-            try:
-                os.makedirs(TRACE_DIR)
-                logger.info("Successfully created trace directory.")
-            except OSError as e:
-                logger.error(f"FATAL: Failed to create trace directory. Please check permissions. Error: {e}", exc_info=True)
-                return # Exit if we can't create the directory
-        # --- END: Modification ---
-            
+            os.makedirs(TRACE_DIR)
+        
         trace_files = glob.glob(os.path.join(TRACE_DIR, "trace_*.zip"))
         trace_files.sort(key=os.path.getctime, reverse=True)
         
         if len(trace_files) > 5:
             files_to_delete = trace_files[5:]
-            logger.info(f"Found {len(trace_files)} traces. Deleting {len(files_to_delete)} oldest ones.")
             for f in files_to_delete:
-                try:
-                    os.remove(f)
-                    logger.info(f"Deleted old trace: {f}")
-                except OSError as e:
-                    logger.error(f"Error deleting old trace file {f}: {e}", exc_info=True)
+                os.remove(f)
 
     except Exception as e:
-        logger.error(f"An unexpected error occurred while managing trace files: {e}", exc_info=True)
+        logger.error(f"Error managing trace files: {e}", exc_info=True)
 
 async def fetch_hku_token(email, password, headless=True):
     """
-    Launches a Playwright browser for login and captures a trace for debugging.
+    Launches a Playwright browser for login with robust, hybrid MFA detection.
     """
-    # --- ADDED: Call manage_trace_files early to ensure directory exists before starting ---
     manage_trace_files()
-    # --- END: Addition ---
 
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
@@ -80,7 +62,6 @@ async def fetch_hku_token(email, password, headless=True):
         page.on("request", intercept_request)
 
         try:
-            # ... (the rest of the logic remains the same)
             if headless:
                 chat_interface_locator = page.locator("#chat-textarea")
                 
@@ -100,6 +81,19 @@ async def fetch_hku_token(email, password, headless=True):
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     
                     login_page = await popup_info.value
+
+                    # --- START: New Hybrid MFA Detection ---
+                    mfa_detected_by_network = asyncio.Event()
+
+                    async def intercept_mfa_poll(request):
+                        # This is the reliable, language-independent check from your trace file
+                        if "/SAS/EndAuth" in request.url and "authMethodId" in request.url:
+                            logger.info(f"MFA network poll detected: {request.url}")
+                            mfa_detected_by_network.set()
+
+                    login_page.on("request", intercept_mfa_poll)
+                    # --- END: New Hybrid MFA Detection ---
+
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
                     logger.info("Pop-up window detected. Proceeding with Microsoft login.")
 
@@ -109,23 +103,35 @@ async def fetch_hku_token(email, password, headless=True):
 
                     await login_page.locator("#passwordInput").fill(password)
                     await login_page.locator("#submitButton").click()
-                    logger.info("Password submitted.")
-
-                    logger.info("Handling 'Stay signed in?' prompt if it appears...")
-                    try:
-                        stay_signed_in_button = login_page.locator(
-                            '[data-testid="KmsiYes"], input[type="submit"][value="Yes"], input[type="submit"][value="是"]'
-                        )
-                        await stay_signed_in_button.click(timeout=10000)
-                        logger.info("Handled 'Stay signed in?' prompt.")
-                    except PlaywrightTimeoutError:
-                        logger.info("'Stay signed in?' prompt did not appear, continuing.")
-
-                    logger.info("Waiting for the main chat page to finish loading...")
-                    await page.wait_for_load_state("networkidle", timeout=90000)
+                    logger.info("Password submitted. Checking for MFA or successful login.")
                     
-                    await chat_interface_locator.wait_for(state="visible", timeout=10000)
-                    logger.info("Chat interface is ready.")
+                    # Define locators for both possible UI outcomes
+                    # This locator is more generic and looks for the displayed number code.
+                    mfa_ui_locator = login_page.locator("div[role='heading'][aria-level='1']")
+                    login_success_locator = page.locator("#chat-textarea")
+                    
+                    # Race the network detection against the two UI outcomes
+                    finished_network_mfa_check = asyncio.create_task(mfa_detected_by_network.wait())
+                    finished_ui_mfa_check = asyncio.create_task(mfa_ui_locator.wait_for(state="visible", timeout=60000))
+                    finished_login_check = asyncio.create_task(login_success_locator.wait_for(state="visible", timeout=60000))
+
+                    done, pending = await asyncio.wait(
+                        [finished_network_mfa_check, finished_ui_mfa_check, finished_login_check], 
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    for task in pending:
+                        task.cancel()
+
+                    if finished_network_mfa_check in done or finished_ui_mfa_check in done:
+                        logger.error("="*70)
+                        logger.error("MFA PROMPT DETECTED. Automated login cannot proceed.")
+                        logger.error("Please run `python manual_mfa_refresh.py` to log in manually.")
+                        logger.error("="*70)
+                        raise Exception("MFA validation is required, aborting auto-refresh.")
+                    
+                    elif finished_login_check in done:
+                         logger.info("No MFA prompt detected. Login appears successful.")
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
 
@@ -139,7 +145,7 @@ async def fetch_hku_token(email, password, headless=True):
                 await send_button.click()
                 logger.info("Sent a message to capture token.")
             else:
-                logger.info("Browser is open. Please complete the login and MFA process manually.")
+                logger.info("Browser is open. Please complete the login process manually.")
                 logger.info("The script will wait until a token is captured.")
 
             await asyncio.wait_for(token_captured.wait(), timeout=None if not headless else 180)
@@ -154,17 +160,11 @@ async def fetch_hku_token(email, password, headless=True):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             trace_path = os.path.join(TRACE_DIR, f"trace_{timestamp}.zip")
             
-            logger.info(f"Attempting to save debugging trace to: {trace_path}")
             try:
                 await context.tracing.stop(path=trace_path)
-                logger.info(f"Successfully saved debugging trace.")
-                # Verify file exists after saving
-                if os.path.exists(trace_path):
-                    logger.info(f"VERIFIED: Trace file exists at {trace_path}")
-                else:
-                    logger.error(f"CRITICAL ERROR: Playwright reported saving trace, but file does not exist at {trace_path}")
+                logger.info(f"Debugging trace saved to '{trace_path}'.")
             except Exception as e:
-                logger.error(f"FATAL: An error occurred while trying to save the trace file: {e}", exc_info=True)
+                logger.error(f"An error occurred while trying to save the trace file: {e}", exc_info=True)
             
             await context.close()
             
