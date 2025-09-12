@@ -26,7 +26,7 @@ class MfaNotificationError(Exception):
 
 async def send_mfa_number_alert_with_retries(number: str):
     """
-    Attempts to send an email with the MFA number, retrying on failure.
+    Attempts to send an email with the MFA number, retrying on failure with longer delays.
     Returns True on success, raises MfaNotificationError on persistent failure.
     """
     load_dotenv()
@@ -68,8 +68,10 @@ async def send_mfa_number_alert_with_retries(number: str):
     msg['From'] = from_email
     msg['To'] = to_email
 
+    # --- NEW: Adjusted retry logic for final attempt at 3m 15s ---
+    retry_delays = [90, 105] # Delay for 2nd attempt (1m 30s), final attempt (1m 45s later)
     max_retries = 3
-    retry_delay_seconds = 10
+
     for attempt in range(max_retries):
         try:
             server = smtplib.SMTP(smtp_server, smtp_port)
@@ -82,7 +84,9 @@ async def send_mfa_number_alert_with_retries(number: str):
         except Exception as e:
             logger.error(f"Failed to send MFA number email (Attempt #{attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay_seconds)
+                delay = retry_delays[attempt]
+                logger.info(f"Retrying to send email in {delay} seconds...")
+                await asyncio.sleep(delay)
             else:
                 logger.error("All attempts to send MFA notification email have failed.")
                 raise MfaNotificationError("Could not send MFA notification email after multiple retries.")
@@ -164,13 +168,10 @@ async def fetch_hku_token(email, password, headless=True):
                     await login_page.locator("#submitButton, input[type='submit']").click()
                     logger.info("Password submitted. Determining next step...")
 
-                    # --- MODIFIED LOGIC: Handle multiple possible MFA screens ---
-                    # Define locators for all possible outcomes after password submission
                     mfa_selection_locator = login_page.locator('div.tile[data-value="CompanionAppsNotification"]')
                     mfa_number_locator = login_page.locator("div.displaySign")
                     kmsi_locator = login_page.locator('text="Stay signed in?"')
                     
-                    # Race all possible outcomes to see which screen appears first
                     mfa_selection_task = asyncio.create_task(mfa_selection_locator.wait_for(state="visible", timeout=60000))
                     mfa_number_task = asyncio.create_task(mfa_number_locator.wait_for(state="visible", timeout=60000))
                     kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=60000))
@@ -182,26 +183,20 @@ async def fetch_hku_token(email, password, headless=True):
                     )
                     for task in pending: task.cancel()
 
-                    # -- STATE 1: MFA method selection screen appears --
                     if mfa_selection_task in done:
                         logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
                         await mfa_selection_locator.click()
-                        # After clicking, we now expect the number matching screen to appear.
                         logger.info("Waiting for the number matching screen...")
                         await mfa_number_locator.wait_for(state="visible", timeout=60000)
-                        # The logic will now naturally fall through to the next block.
 
-                    # -- STATE 2: Number matching screen appears (either directly or after selection) --
                     if mfa_number_locator.is_visible():
                         mfa_number = await mfa_number_locator.inner_text()
                         logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
                         
-                        # --- NEW: Call the robust email function ---
                         await send_mfa_number_alert_with_retries(mfa_number)
                         
                         try:
                             logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
-                            # After user approves, wait for either KMSI or final success
                             post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
                             post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
                             
@@ -219,7 +214,6 @@ async def fetch_hku_token(email, password, headless=True):
                         except PlaywrightTimeoutError:
                             raise MfaTimeoutError("User did not approve MFA within the time limit.")
 
-                    # -- STATE 3: "Stay Signed In?" screen appears directly --
                     elif kmsi_task in done:
                         logger.info("'Stay signed in?' prompt detected. Checking box and clicking Yes.")
                         await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
@@ -227,7 +221,6 @@ async def fetch_hku_token(email, password, headless=True):
                         await chat_input_locator.wait_for(state="visible", timeout=60000)
                         logger.info("Login successful after handling prompt.")
 
-                    # -- STATE 4: Login succeeds directly --
                     elif success_task in done:
                         logger.info("Direct login successful.")
                     
@@ -248,7 +241,6 @@ async def fetch_hku_token(email, password, headless=True):
         except Exception as e:
             logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
             if headless: await page.screenshot(path="debug_screenshot.png")
-            # Re-raise specific exceptions to be handled by the main loop
             if isinstance(e, (MfaTimeoutError, MfaNotificationError)):
                 raise e
             return None
