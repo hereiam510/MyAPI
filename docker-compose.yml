@@ -10,3 +10,7 @@ services:
     ports:
       - "${PROXY_PORT:-8000}:8000"
     restart: unless-stopped
+    volumes:
+      # This maps the './traces' folder on your Mac 
+      # to the '/app/traces' folder inside the container.
+      - ./traces:/app/traces
