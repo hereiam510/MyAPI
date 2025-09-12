@@ -67,9 +67,8 @@ async def send_mfa_number_alert_with_retries(number: str):
     msg['Subject'] = subject
     msg['From'] = from_email
     msg['To'] = to_email
-
-    # --- NEW: Adjusted retry logic for final attempt at 3m 15s ---
-    retry_delays = [90, 105] # Delay for 2nd attempt (1m 30s), final attempt (1m 45s later)
+    
+    retry_delays = [90, 105] 
     max_retries = 3
 
     for attempt in range(max_retries):
@@ -80,7 +79,7 @@ async def send_mfa_number_alert_with_retries(number: str):
             server.sendmail(from_email, to_email, msg.as_string())
             server.quit()
             logger.info(f"MFA number email sent to {to_email} (Attempt #{attempt + 1}). Waiting for approval...")
-            return True # Success
+            return True 
         except Exception as e:
             logger.error(f"Failed to send MFA number email (Attempt #{attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -145,6 +144,12 @@ async def fetch_hku_token(email, password, headless=True):
                     login_page = await popup_info.value
                     await login_page.wait_for_load_state('networkidle', timeout=60000)
 
+                    # --- NEW: Handle the "Pick an account" screen ---
+                    account_picker_locator = login_page.locator(f'div[data-test-id="{email}"]')
+                    if await account_picker_locator.is_visible(timeout=10000):
+                        logger.info("Account picker screen detected. Selecting saved account.")
+                        await account_picker_locator.click()
+
                     hku_pin_page_locator = login_page.locator("input[name='PIN']")
                     ms_email_page_locator = login_page.locator("input[type='email']")
                     
@@ -156,13 +161,15 @@ async def fetch_hku_token(email, password, headless=True):
                         for task in pending: task.cancel()
 
                         if hku_task in done:
+                            # This case might be skipped if account picker is used, but good to keep
                             await login_page.locator("input[type='email']").fill(email)
-                        elif ms_task in done:
+                        elif ms_task in done and await ms_email_page_locator.is_visible():
+                             # Only fill if the email field is still visible after the account picker
                             await ms_email_page_locator.fill(email)
                             await login_page.locator('input[type="submit"]').click()
                     except PlaywrightTimeoutError:
-                        logger.error("Could not find the email/username input field on the login page.")
-                        raise
+                        logger.info("Email input not found, likely handled by account picker. Proceeding.")
+
 
                     await login_page.locator("#passwordInput, input[name='PIN']").fill(password)
                     await login_page.locator("#submitButton, input[type='submit']").click()
@@ -189,32 +196,55 @@ async def fetch_hku_token(email, password, headless=True):
                         logger.info("Waiting for the number matching screen...")
                         await mfa_number_locator.wait_for(state="visible", timeout=60000)
 
-                    if mfa_number_locator.is_visible():
-                        mfa_number = await mfa_number_locator.inner_text()
-                        logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
-                        
-                        await send_mfa_number_alert_with_retries(mfa_number)
-                        
-                        try:
-                            logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
-                            post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
-                            post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
+                    mfa_max_attempts = 3
+                    for attempt in range(mfa_max_attempts):
+                        if await mfa_number_locator.is_visible():
+                            mfa_number = await mfa_number_locator.inner_text()
+                            logger.warning(f"MFA PROMPT (Attempt #{attempt + 1}/{mfa_max_attempts}) DETECTED with number: {mfa_number}.")
                             
-                            done_after_mfa, pending_after_mfa = await asyncio.wait([post_mfa_kmsi_task, post_mfa_success_task], return_when=asyncio.FIRST_COMPLETED)
-                            for task in pending_after_mfa: task.cancel()
-
-                            if post_mfa_kmsi_task in done_after_mfa:
-                                logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
-                                await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
-                                await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                            await send_mfa_number_alert_with_retries(mfa_number)
                             
-                            await chat_input_locator.wait_for(state="visible", timeout=60000)
-                            logger.info("MFA flow complete. Login successful.")
+                            try:
+                                logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
+                                denied_locator = login_page.locator('text="Request denied"')
+                                
+                                post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
+                                post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
+                                post_mfa_denied_task = asyncio.create_task(denied_locator.wait_for(state="visible", timeout=285000))
 
-                        except PlaywrightTimeoutError:
-                            raise MfaTimeoutError("User did not approve MFA within the time limit.")
+                                done_after_mfa, pending_after_mfa = await asyncio.wait(
+                                    [post_mfa_kmsi_task, post_mfa_success_task, post_mfa_denied_task],
+                                    return_when=asyncio.FIRST_COMPLETED
+                                )
+                                for task in pending_after_mfa: task.cancel()
+                                
+                                if post_mfa_kmsi_task in done_after_mfa or post_mfa_success_task in done_after_mfa:
+                                    if post_mfa_kmsi_task in done_after_mfa:
+                                        logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
+                                        await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
+                                        await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                                    
+                                    await chat_input_locator.wait_for(state="visible", timeout=60000)
+                                    logger.info("MFA flow complete. Login successful.")
+                                    break 
 
-                    elif kmsi_task in done:
+                                elif post_mfa_denied_task in done_after_mfa:
+                                    logger.error(f"MFA request was denied by the user (Attempt #{attempt + 1}).")
+                                    if attempt < mfa_max_attempts - 1:
+                                        logger.warning("Requesting a new MFA prompt...")
+                                        resend_link = login_page.locator('a:has-text("Send another request")')
+                                        await resend_link.click()
+                                        await mfa_number_locator.wait_for(state="visible", timeout=30000)
+                                        continue 
+                                    else:
+                                        raise MfaTimeoutError("MFA request denied multiple times. Aborting.")
+                                
+                            except PlaywrightTimeoutError:
+                                raise MfaTimeoutError("User did not approve MFA within the time limit.")
+                        else:
+                            break
+                    
+                    if await kmsi_locator.is_visible():
                         logger.info("'Stay signed in?' prompt detected. Checking box and clicking Yes.")
                         await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
                         await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
@@ -224,7 +254,7 @@ async def fetch_hku_token(email, password, headless=True):
                     elif success_task in done:
                         logger.info("Direct login successful.")
                     
-                    else:
+                    if not await chat_input_locator.is_visible():
                         raise Exception("Login flow stalled after password submission. No known next step detected.")
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
