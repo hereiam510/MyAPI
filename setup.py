@@ -65,7 +65,6 @@ def install_local_dependencies():
     print("✅ Playwright browsers installed.")
     return True
 
-# --- NEW FUNCTION TO SET UP SHELL ALIAS ---
 def setup_shell_alias():
     """Asks the user if they want to create a convenient shell alias for viewing traces."""
     print("\n--- Optional: Create Shell Alias ---")
@@ -113,7 +112,7 @@ def setup_shell_alias():
             f.write("\n# Alias for HKU ChatGPT Proxy project to view latest trace\n")
             f.write(f"{alias_command}\n")
         print(f"\n✅ Alias '{alias_name}' has been added to {config_file}.")
-        print("Please run `source {config_file}` or restart your terminal to use it.")
+        print(f"Please run `source {config_file}` or restart your terminal to use it.")
     except IOError as e:
         logger.error(f"Error writing to shell config file: {e}", exc_info=True)
         print(f"❌ Could not write to {config_file}. Please add the alias manually.")
@@ -348,10 +347,8 @@ def main():
     # Run the service start first
     if not start_docker_service(): sys.exit(1)
     
-    # --- MOVED ALIAS SETUP STEP TO THE END ---
     # Offer the optional convenience alias after the main setup is successful.
     setup_shell_alias()
 
 if __name__ == "__main__":
     main()
-
