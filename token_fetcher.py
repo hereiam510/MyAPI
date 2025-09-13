@@ -262,7 +262,7 @@ async def fetch_hku_token(email, password, headless=True):
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
 
-                await chat_input_locator.fill('Hello')
+                await chat_input_locator.fill('1')
                 await send_button_locator.click()
                 logger.info("Sent a message to capture token.")
             else:
