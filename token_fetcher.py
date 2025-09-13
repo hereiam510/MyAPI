@@ -54,14 +54,14 @@ async def send_mfa_number_alert_with_retries(number: str):
 
     subject = f"[HKU ChatGPT Proxy] ACTION REQUIRED: Enter MFA Code {number}"
     body = (
-        f"The automated login requires your approval.\\n\\n"
-        f"Please open your Outlook/Authenticator app and enter this number:\\n\\n"
-        f"==================\\n"
-        f"         {number}\\n"
-        f"==================\\n\\n"
-        f"This prompt was triggered at: {trigger_time_str}\\n"
-        f"Please enter the code before: {deadline_str}\\n\\n"
-        "The script will wait for up to 4 minutes and 45 seconds for you to complete this step.\\n"
+        f"The automated login requires your approval.\n\n"
+        f"Please open your Outlook/Authenticator app and enter this number:\n\n"
+        f"==================\n"
+        f"         {number}\n"
+        f"==================\n\n"
+        f"This prompt was triggered at: {trigger_time_str}\n"
+        f"Please enter the code before: {deadline_str}\n\n"
+        "The script will wait for up to 4 minutes and 45 seconds for you to complete this step.\n"
     )
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -182,11 +182,7 @@ async def fetch_hku_token(email, password, headless=True):
                         await login_page.locator("#submitButton, input[type='submit']").click()
                         logger.info("Password submitted. Determining next step...")
                         
-                        # --- START: FINAL FIX ---
-                        # Use a more resilient text-based locator for the MFA selection.
                         mfa_selection_locator = login_page.get_by_text("Approve a request on my Outlook mobile app")
-                        # --- END: FINAL FIX ---
-
                         mfa_number_locator = login_page.locator("div.displaySign")
                         kmsi_locator = login_page.locator('text="Stay signed in?"')
 
@@ -209,11 +205,8 @@ async def fetch_hku_token(email, password, headless=True):
 
                         elif mfa_selection_task in done:
                             logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
-                            # --- START: FINAL FIX ---
-                            # Add a brief pause to allow the page's JS to stabilize before clicking.
                             await asyncio.sleep(2)
                             await mfa_selection_locator.click()
-                            # --- END: FINAL FIX ---
                             logger.info("Waiting for the number matching screen...")
                             await mfa_number_locator.wait_for(state="visible", timeout=60000)
 
