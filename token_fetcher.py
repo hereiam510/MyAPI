@@ -8,6 +8,7 @@ import pytz
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright._impl._errors import TargetClosedError
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,16 @@ async def fetch_hku_token(email, password, headless=True):
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     login_page = await popup_info.value
 
+                    # FIX: Handle account picker and the race condition where the popup closes during the check.
+                    try:
+                        logger.info("Checking for Microsoft account picker...")
+                        account_picker_locator = login_page.locator(f'div[data-test-id="{email}"]')
+                        await account_picker_locator.wait_for(state="visible", timeout=10000)
+                        logger.info("Account picker detected. Clicking the correct account to proceed.")
+                        await account_picker_locator.click()
+                    except (PlaywrightTimeoutError, TargetClosedError):
+                        logger.info("Account picker not found or popup closed during check; proceeding with standard login flow.")
+                    
                     logger.info("Login popup initiated. Determining login flow type...")
                     
                     successful_login_task = asyncio.create_task(
@@ -161,12 +172,12 @@ async def fetch_hku_token(email, password, headless=True):
                         )
                         for task in pending:
                             task.cancel()
-                    except PlaywrightTimeoutError:
+                    except (PlaywrightTimeoutError, TargetClosedError):
                         await successful_login_task
                         done = {successful_login_task}
 
-                    if successful_login_task in done:
-                        logger.info("Fast login successful due to existing session. Bypassing manual entry.")
+                    if successful_login_task in done or login_page.is_closed():
+                        logger.info("Fast login successful due to existing session or closed popup. Bypassing manual entry.")
                         if not login_page.is_closed():
                             await login_page.close()
                     else:
