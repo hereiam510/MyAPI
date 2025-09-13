@@ -68,8 +68,7 @@ async def send_mfa_number_alert_with_retries(number: str):
     msg['From'] = from_email
     msg['To'] = to_email
 
-    # --- NEW: Adjusted retry logic for final attempt at 3m 15s ---
-    retry_delays = [90, 105] # Delay for 2nd attempt (1m 30s), final attempt (1m 45s later)
+    retry_delays = [90, 105]
     max_retries = 3
 
     for attempt in range(max_retries):
@@ -80,7 +79,7 @@ async def send_mfa_number_alert_with_retries(number: str):
             server.sendmail(from_email, to_email, msg.as_string())
             server.quit()
             logger.info(f"MFA number email sent to {to_email} (Attempt #{attempt + 1}). Waiting for approval...")
-            return True # Success
+            return True
         except Exception as e:
             logger.error(f"Failed to send MFA number email (Attempt #{attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -123,9 +122,9 @@ async def fetch_hku_token(email, password, headless=True):
             if "completions" in request.url and "authorization" in request.headers:
                 token = request.headers["authorization"].split(" ")[1]
                 token_captured.set()
-        
+
         page.on("request", intercept_request)
-        
+
         chat_input_locator = page.locator('textarea[placeholder*="Type your query here"]')
         send_button_locator = page.locator('[data-testid="send-button"], button:has-text("Send")')
 
@@ -143,89 +142,122 @@ async def fetch_hku_token(email, password, headless=True):
                     async with page.expect_popup() as popup_info:
                         await page.click('button:has-text("Sign In")', timeout=20000)
                     login_page = await popup_info.value
-                    await login_page.wait_for_load_state('networkidle', timeout=60000)
 
-                    hku_pin_page_locator = login_page.locator("input[name='PIN']")
-                    ms_email_page_locator = login_page.locator("input[type='email']")
+                    logger.info("Login popup initiated. Determining login flow type...")
+                    
+                    successful_login_task = asyncio.create_task(
+                        chat_input_locator.wait_for(state="visible", timeout=60000)
+                    )
                     
                     try:
-                        hku_task = asyncio.create_task(hku_pin_page_locator.wait_for(state="visible", timeout=15000))
-                        ms_task = asyncio.create_task(ms_email_page_locator.wait_for(state="visible", timeout=15000))
-                        
-                        done, pending = await asyncio.wait([hku_task, ms_task], return_when=asyncio.FIRST_COMPLETED)
-                        for task in pending: task.cancel()
+                        hku_pin_page_locator = login_page.locator("input[name='PIN']")
+                        ms_email_page_locator = login_page.locator("input[type='email']")
+                        hku_input_task = asyncio.create_task(hku_pin_page_locator.wait_for(state="visible", timeout=60000))
+                        ms_input_task = asyncio.create_task(ms_email_page_locator.wait_for(state="visible", timeout=60000))
 
-                        if hku_task in done:
+                        done, pending = await asyncio.wait(
+                            [successful_login_task, hku_input_task, ms_input_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task in pending:
+                            task.cancel()
+                    except PlaywrightTimeoutError:
+                         # This can happen if the popup closes before we can even find the locators
+                        await successful_login_task
+                        done = {successful_login_task}
+
+
+                    if successful_login_task in done:
+                        logger.info("Fast login successful due to existing session. Bypassing manual entry.")
+                        if not login_page.is_closed():
+                            await login_page.close()
+                    else:
+                        logger.info("Manual login page detected. Proceeding to enter credentials.")
+                        
+                        # --- START: FIX ---
+                        # Instead of waiting for networkidle which might time out,
+                        # we race the next expected user action against a successful login.
+                        if hku_input_task in done:
                             await login_page.locator("input[type='email']").fill(email)
-                        elif ms_task in done:
+                        elif ms_input_task in done:
                             await ms_email_page_locator.fill(email)
                             await login_page.locator('input[type="submit"]').click()
-                    except PlaywrightTimeoutError:
-                        logger.error("Could not find the email/username input field on the login page.")
-                        raise
-
-                    await login_page.locator("#passwordInput, input[name='PIN']").fill(password)
-                    await login_page.locator("#submitButton, input[type='submit']").click()
-                    logger.info("Password submitted. Determining next step...")
-
-                    mfa_selection_locator = login_page.locator('div.tile[data-value="CompanionAppsNotification"]')
-                    mfa_number_locator = login_page.locator("div.displaySign")
-                    kmsi_locator = login_page.locator('text="Stay signed in?"')
-                    
-                    mfa_selection_task = asyncio.create_task(mfa_selection_locator.wait_for(state="visible", timeout=60000))
-                    mfa_number_task = asyncio.create_task(mfa_number_locator.wait_for(state="visible", timeout=60000))
-                    kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=60000))
-                    success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=60000))
-
-                    done, pending = await asyncio.wait(
-                        [mfa_selection_task, mfa_number_task, kmsi_task, success_task],
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for task in pending: task.cancel()
-
-                    if mfa_selection_task in done:
-                        logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
-                        await mfa_selection_locator.click()
-                        logger.info("Waiting for the number matching screen...")
-                        await mfa_number_locator.wait_for(state="visible", timeout=60000)
-
-                    if mfa_number_locator.is_visible():
-                        mfa_number = await mfa_number_locator.inner_text()
-                        logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
                         
-                        await send_mfa_number_alert_with_retries(mfa_number)
-                        
-                        try:
-                            logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
-                            post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
-                            post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
-                            
-                            done_after_mfa, pending_after_mfa = await asyncio.wait([post_mfa_kmsi_task, post_mfa_success_task], return_when=asyncio.FIRST_COMPLETED)
-                            for task in pending_after_mfa: task.cancel()
+                        await login_page.locator("#passwordInput, input[name='PIN']").fill(password)
+                        await login_page.locator("#submitButton, input[type='submit']").click()
+                        logger.info("Password submitted. Determining next step...")
 
-                            if post_mfa_kmsi_task in done_after_mfa:
-                                logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
-                                await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
-                                await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                        # After submitting, the next step could be anything: MFA, KMSI, or direct success.
+                        # So we race all possibilities.
+                        mfa_selection_locator = login_page.locator('div.tile[data-value="CompanionAppsNotification"]')
+                        mfa_number_locator = login_page.locator("div.displaySign")
+                        kmsi_locator = login_page.locator('text="Stay signed in?"')
+
+                        # Add the successful login on the main page as a possible outcome
+                        post_password_success_task = asyncio.create_task(
+                            chat_input_locator.wait_for(state="visible", timeout=60000)
+                        )
+                        
+                        mfa_selection_task = asyncio.create_task(mfa_selection_locator.wait_for(state="visible", timeout=60000))
+                        mfa_number_task = asyncio.create_task(mfa_number_locator.wait_for(state="visible", timeout=60000))
+                        kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=60000))
+                        # --- END: FIX ---
+
+                        done, pending = await asyncio.wait(
+                            [post_password_success_task, mfa_selection_task, mfa_number_task, kmsi_task],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task in pending: task.cancel()
+
+                        if post_password_success_task in done:
+                             logger.info("Login successful after password submission.")
+
+                        elif mfa_selection_task in done:
+                            logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
+                            await mfa_selection_locator.click()
+                            logger.info("Waiting for the number matching screen...")
+                            await mfa_number_locator.wait_for(state="visible", timeout=60000)
+
+                        if mfa_number_locator.is_visible(): # Re-check visibility in case it appeared after selection
+                            mfa_number = await mfa_number_locator.inner_text()
+                            logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
                             
+                            await send_mfa_number_alert_with_retries(mfa_number)
+                            
+                            try:
+                                logger.info("Waiting for user to approve MFA (up to 4m 45s)...")
+                                post_mfa_kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=285000))
+                                post_mfa_success_task = asyncio.create_task(chat_input_locator.wait_for(state="visible", timeout=285000))
+                                
+                                done_after_mfa, pending_after_mfa = await asyncio.wait([post_mfa_kmsi_task, post_mfa_success_task], return_when=asyncio.FIRST_COMPLETED)
+                                for task in pending_after_mfa: task.cancel()
+
+                                if post_mfa_kmsi_task in done_after_mfa:
+                                    logger.info("MFA approved, now handling 'Stay signed in?' prompt.")
+                                    await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
+                                    await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
+                                
+                                await chat_input_locator.wait_for(state="visible", timeout=60000)
+                                logger.info("MFA flow complete. Login successful.")
+
+                            except PlaywrightTimeoutError:
+                                raise MfaTimeoutError("User did not approve MFA within the time limit.")
+
+                        elif kmsi_task in done:
+                            logger.info("'Stay signed in?' prompt detected. Checking box and clicking Yes.")
+                            await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
+                            await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
                             await chat_input_locator.wait_for(state="visible", timeout=60000)
-                            logger.info("MFA flow complete. Login successful.")
-
-                        except PlaywrightTimeoutError:
-                            raise MfaTimeoutError("User did not approve MFA within the time limit.")
-
-                    elif kmsi_task in done:
-                        logger.info("'Stay signed in?' prompt detected. Checking box and clicking Yes.")
-                        await login_page.locator("#KmsiCheckboxField").check(timeout=5000)
-                        await login_page.locator('[data-testid="KmsiYes"], input[type="submit"][value="Yes"]').click()
-                        await chat_input_locator.wait_for(state="visible", timeout=60000)
-                        logger.info("Login successful after handling prompt.")
-
-                    elif success_task in done:
-                        logger.info("Direct login successful.")
-                    
-                    else:
-                        raise Exception("Login flow stalled after password submission. No known next step detected.")
+                            logger.info("Login successful after handling prompt.")
+                        
+                        else:
+                            # If we are here, none of the known interactive steps appeared.
+                            # We might have missed the success case. Check one last time.
+                            try:
+                                await chat_input_locator.wait_for(state="visible", timeout=5000)
+                                logger.info("Direct login successful after password submission.")
+                            except PlaywrightTimeoutError:
+                                raise Exception("Login flow stalled after password submission. No known next step detected.")
                 else:
                     logger.info("✅ Valid session found. Skipping login.")
 
@@ -240,7 +272,11 @@ async def fetch_hku_token(email, password, headless=True):
 
         except Exception as e:
             logger.error(f"Token acquisition failed. Error: {e}", exc_info=True)
-            if headless: await page.screenshot(path="debug_screenshot.png")
+            if headless: 
+                try:
+                    await page.screenshot(path="debug_screenshot.png")
+                except Exception as screenshot_error:
+                    logger.error(f"Failed to take debug screenshot: {screenshot_error}")
             if isinstance(e, (MfaTimeoutError, MfaNotificationError)):
                 raise e
             return None
@@ -253,5 +289,5 @@ async def fetch_hku_token(email, password, headless=True):
             except Exception as e:
                 logger.error(f"Error saving trace file: {e}", exc_info=True)
             await context.close()
-            
+
         return token
