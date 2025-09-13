@@ -54,14 +54,14 @@ async def send_mfa_number_alert_with_retries(number: str):
 
     subject = f"[HKU ChatGPT Proxy] ACTION REQUIRED: Enter MFA Code {number}"
     body = (
-        f"The automated login requires your approval.\n\n"
-        f"Please open your Outlook/Authenticator app and enter this number:\n\n"
-        f"==================\n"
-        f"         {number}\n"
-        f"==================\n\n"
-        f"This prompt was triggered at: {trigger_time_str}\n"
-        f"Please enter the code before: {deadline_str}\n\n"
-        "The script will wait for up to 4 minutes and 45 seconds for you to complete this step.\n"
+        f"The automated login requires your approval.\\n\\n"
+        f"Please open your Outlook/Authenticator app and enter this number:\\n\\n"
+        f"==================\\n"
+        f"         {number}\\n"
+        f"==================\\n\\n"
+        f"This prompt was triggered at: {trigger_time_str}\\n"
+        f"Please enter the code before: {deadline_str}\\n\\n"
+        "The script will wait for up to 4 minutes and 45 seconds for you to complete this step.\\n"
     )
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -162,10 +162,8 @@ async def fetch_hku_token(email, password, headless=True):
                         for task in pending:
                             task.cancel()
                     except PlaywrightTimeoutError:
-                         # This can happen if the popup closes before we can even find the locators
                         await successful_login_task
                         done = {successful_login_task}
-
 
                     if successful_login_task in done:
                         logger.info("Fast login successful due to existing session. Bypassing manual entry.")
@@ -174,9 +172,6 @@ async def fetch_hku_token(email, password, headless=True):
                     else:
                         logger.info("Manual login page detected. Proceeding to enter credentials.")
                         
-                        # --- START: FIX ---
-                        # Instead of waiting for networkidle which might time out,
-                        # we race the next expected user action against a successful login.
                         if hku_input_task in done:
                             await login_page.locator("input[type='email']").fill(email)
                         elif ms_input_task in done:
@@ -186,14 +181,15 @@ async def fetch_hku_token(email, password, headless=True):
                         await login_page.locator("#passwordInput, input[name='PIN']").fill(password)
                         await login_page.locator("#submitButton, input[type='submit']").click()
                         logger.info("Password submitted. Determining next step...")
+                        
+                        # --- START: FINAL FIX ---
+                        # Use a more resilient text-based locator for the MFA selection.
+                        mfa_selection_locator = login_page.get_by_text("Approve a request on my Outlook mobile app")
+                        # --- END: FINAL FIX ---
 
-                        # After submitting, the next step could be anything: MFA, KMSI, or direct success.
-                        # So we race all possibilities.
-                        mfa_selection_locator = login_page.locator('div.tile[data-value="CompanionAppsNotification"]')
                         mfa_number_locator = login_page.locator("div.displaySign")
                         kmsi_locator = login_page.locator('text="Stay signed in?"')
 
-                        # Add the successful login on the main page as a possible outcome
                         post_password_success_task = asyncio.create_task(
                             chat_input_locator.wait_for(state="visible", timeout=60000)
                         )
@@ -201,7 +197,6 @@ async def fetch_hku_token(email, password, headless=True):
                         mfa_selection_task = asyncio.create_task(mfa_selection_locator.wait_for(state="visible", timeout=60000))
                         mfa_number_task = asyncio.create_task(mfa_number_locator.wait_for(state="visible", timeout=60000))
                         kmsi_task = asyncio.create_task(kmsi_locator.wait_for(state="visible", timeout=60000))
-                        # --- END: FIX ---
 
                         done, pending = await asyncio.wait(
                             [post_password_success_task, mfa_selection_task, mfa_number_task, kmsi_task],
@@ -214,11 +209,15 @@ async def fetch_hku_token(email, password, headless=True):
 
                         elif mfa_selection_task in done:
                             logger.info("MFA method selection screen detected. Automatically choosing 'Approve a request...'.")
+                            # --- START: FINAL FIX ---
+                            # Add a brief pause to allow the page's JS to stabilize before clicking.
+                            await asyncio.sleep(2)
                             await mfa_selection_locator.click()
+                            # --- END: FINAL FIX ---
                             logger.info("Waiting for the number matching screen...")
                             await mfa_number_locator.wait_for(state="visible", timeout=60000)
 
-                        if mfa_number_locator.is_visible(): # Re-check visibility in case it appeared after selection
+                        if await mfa_number_locator.is_visible():
                             mfa_number = await mfa_number_locator.inner_text()
                             logger.warning(f"MFA PROMPT (Number Match) DETECTED with number: {mfa_number}.")
                             
@@ -251,8 +250,6 @@ async def fetch_hku_token(email, password, headless=True):
                             logger.info("Login successful after handling prompt.")
                         
                         else:
-                            # If we are here, none of the known interactive steps appeared.
-                            # We might have missed the success case. Check one last time.
                             try:
                                 await chat_input_locator.wait_for(state="visible", timeout=5000)
                                 logger.info("Direct login successful after password submission.")
