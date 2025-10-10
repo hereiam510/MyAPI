@@ -151,7 +151,6 @@ async def proxy_chat_completions(request: Request):
     messages = req_payload.get("messages", [])
     if not messages: raise HTTPException(status_code=400, detail="Request must include messages.")
     
-    # Logic from the old (working) file to construct the payload and headers
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
     forward_payload = {
         "messages": messages, "stream": True, "max_completion_tokens": req_payload.get("max_tokens", 2000)
@@ -171,7 +170,7 @@ async def proxy_chat_completions(request: Request):
     
     async with httpx.AsyncClient() as client:
         try:
-            req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
+            req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=600.0)
             resp = await client.send(req, stream=True)
             
             if resp.status_code == 401:
@@ -184,7 +183,6 @@ async def proxy_chat_completions(request: Request):
             if client_wants_stream:
                 return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
             else:
-                # Handle non-streaming responses by aggregating the stream
                 content_chunks = []
                 async for line in resp.aiter_lines():
                     if line.startswith("data:") and "[DONE]" not in line:
@@ -202,6 +200,10 @@ async def proxy_chat_completions(request: Request):
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 })
+        except httpx.ReadError as e:
+            logger.error(f"An httpx.ReadError occurred: {e}", exc_info=True)
+            logger.error(f"Request payload that caused the error: {forward_payload}")
+            raise HTTPException(status_code=504, detail="A gateway timeout occurred: the upstream server closed the connection without a response.")
         except httpx.HTTPStatusError as e:
             error_body = await e.response.aread()
             raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
