@@ -1,7 +1,8 @@
 # requirements.txt
 fastapi
 uvicorn
-httpx
+httpx[http2]
 python-dotenv
 playwright
 pytz
+h2

@@ -51,7 +51,7 @@ def send_mfa_alert(reason="MFA intervention required."):
     if not all([ALERT_EMAIL_TO, ALERT_EMAIL_FROM, ALERT_EMAIL_PASSWORD]):
         logger.warning("Email alerts not configured. A background refresh has failed and is now stopped.")
         return False
-    
+
     subject = "[HKU ChatGPT Proxy] ACTION REQUIRED: Auto-Refresh Paused"
     body = (
         "Automatic HKU token refresh has failed and is now paused.\\n\\n"
@@ -78,7 +78,7 @@ def send_mfa_alert(reason="MFA intervention required."):
 async def refresh_token_background_loop(app_state):
     failure_intervals = [1, 5]
     failure_count = 0
-    
+
     while True:
         if app_state["is_paused"].is_set():
             logger.warning("TokenRefresh is paused. Waiting for manual token update...")
@@ -89,7 +89,7 @@ async def refresh_token_background_loop(app_state):
         try:
             logger.info("Attempting to auto-refresh HKU token.")
             token = await fetch_hku_token(HKU_EMAIL, HKU_PASSWORD, headless=True)
-            
+
             if token:
                 app_state["hku_auth_token"] = token
                 logger.info("Token updated successfully via background refresh.")
@@ -98,7 +98,7 @@ async def refresh_token_background_loop(app_state):
             else:
                 logger.warning(f"Failed to get new token (Attempt #{failure_count + 1}).")
                 failure_count += 1
-                
+
                 if failure_count < len(failure_intervals):
                     wait_time = failure_intervals[failure_count - 1] * 60
                     logger.info(f"Retrying token refresh in {wait_time / 60} minute(s).")
@@ -112,7 +112,7 @@ async def refresh_token_background_loop(app_state):
             logger.error(f"MFA approval timed out: {e}")
             send_mfa_alert(f"MFA approval timed out. The user did not respond in time.")
             app_state["is_paused"].set()
-        
+
         except MfaNotificationError as e:
             logger.error(f"MFA notification failed: {e}")
             send_mfa_alert(f"Could not send the MFA number alert email after multiple retries. The email system may be misconfigured.")
@@ -136,75 +136,95 @@ def get_api_key(api_key: str = Security(API_KEY_HEADER)):
     return api_key
 
 async def stream_generator(response: httpx.Response):
-    try:
-        async for chunk in response.aiter_bytes():
-            yield chunk
-    finally:
-        await response.aclose()
+    async for chunk in response.aiter_bytes():
+        yield chunk
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     if not app_state["hku_auth_token"]:
-        raise HTTPException(status_code=401, detail="No HKU token available. The service may be waiting for initial refresh.")
+        raise HTTPException(status_code=401, detail="No HKU token available.")
 
     req_payload = await request.json()
-    messages = req_payload.get("messages", [])
-    if not messages: raise HTTPException(status_code=400, detail="Request must include messages.")
-    
-    # Logic from the old (working) file to construct the payload and headers
+
     deployment_id = req_payload.get("model", "gpt-4.1-nano")
     forward_payload = {
-        "messages": messages, "stream": True, "max_completion_tokens": req_payload.get("max_tokens", 2000)
+        "messages": req_payload.get("messages", []),
+        "stream": True,  # We always request a stream from the backend for efficiency
+        "max_completion_tokens": req_payload.get("max_tokens", 2000),
+        "temperature": req_payload.get("temperature", 0.7),
+        "top_p": req_payload.get("top_p", 0.95),
     }
-    if deployment_id in REASONING_MODELS:
-        forward_payload["temperature"] = req_payload.get("temperature", 1.0)
-    else:
-        forward_payload["temperature"] = req_payload.get("temperature", 0.7)
-        forward_payload["top_p"] = req_payload.get("top_p", 0.95)
-    
+
     target_url = f"{HKU_API_BASE_URL}/azure-openai-aad-api/stream/chat/completions"
     headers = {
-        "accept": "text/event-stream", "authorization": f"Bearer {app_state['hku_auth_token']}",
-        "content-type": "application/json", "origin": "https://chatgpt.hku.hk", "referer": "https://chatgpt.hku.hk/",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Authorization": f"Bearer {app_state['hku_auth_token']}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": request.headers.get("user-agent", "Mozilla/5.0"),
     }
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            req = client.build_request("POST", target_url, params={"deployment-id": deployment_id}, json=forward_payload, headers=headers, timeout=300.0)
-            resp = await client.send(req, stream=True)
-            
-            if resp.status_code == 401:
-                logger.error("Received 401 Unauthorized from upstream. Token is likely expired.")
-                raise HTTPException(status_code=401, detail="The HKU Auth Token is invalid or expired.")
-            
-            resp.raise_for_status()
-            
-            client_wants_stream = req_payload.get("stream", False)
-            if client_wants_stream:
-                return StreamingResponse(stream_generator(resp), media_type=resp.headers.get("content-type"))
-            else:
-                # Handle non-streaming responses by aggregating the stream
-                content_chunks = []
-                async for line in resp.aiter_lines():
-                    if line.startswith("data:") and "[DONE]" not in line:
-                        try:
-                            data = json.loads(line[6:])
-                            if "choices" in data and data["choices"]:
-                                delta = data["choices"][0].get("delta", {})
-                                if "content" in delta: content_chunks.append(delta["content"])
-                        except json.JSONDecodeError: continue
-                full_content = "".join(content_chunks)
-                await resp.aclose()
-                return JSONResponse({
-                    "id": f"chatcmpl-test-{os.urandom(8).hex()}", "object": "chat.completion",
-                    "created": int(time.time()), "model": deployment_id,
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": full_content}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                })
-        except httpx.HTTPStatusError as e:
-            error_body = await e.response.aread()
-            raise HTTPException(status_code=e.response.status_code, detail=f"Upstream error: {error_body.decode()}")
+
+    try:
+        client = httpx.AsyncClient(http2=True)
+        resp = await client.request(
+            "POST", 
+            target_url, 
+            params={"deployment-id": deployment_id}, 
+            json=forward_payload, 
+            headers=headers, 
+            timeout=600.0
+        )
+
+        if resp.status_code != 200:
+            error_body = await resp.aread()
+            logger.error(f"Upstream error: {resp.status_code} - {error_body.decode()}")
+            raise HTTPException(status_code=resp.status_code, detail=error_body.decode())
+
+        client_wants_stream = req_payload.get("stream", False)
+
+        if client_wants_stream:
+            # If the client wants a stream, we forward it.
+            return StreamingResponse(
+                stream_generator(resp),
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type"),
+            )
+        else:
+            # If the client wants a single JSON response, we aggregate the stream.
+            content_chunks = []
+            async for line in resp.aiter_lines():
+                if line.startswith("data:") and "[DONE]" not in line:
+                    try:
+                        data = json.loads(line[6:])
+                        if "choices" in data and data["choices"]:
+                            delta = data["choices"][0].get("delta", {})
+                            if "content" in delta:
+                                content_chunks.append(delta["content"])
+                    except json.JSONDecodeError:
+                        continue
+
+            await resp.aclose()
+            full_content = "".join(content_chunks)
+
+            return JSONResponse({
+                "id": f"chatcmpl-{os.urandom(8).hex()}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": deployment_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+    except httpx.RequestError as e:
+        logger.error(f"Error during request to upstream API: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Bad Gateway: {e}")
+
 
 @app.get("/health")
 async def health_check():
